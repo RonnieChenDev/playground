@@ -28,5 +28,5 @@ pm2 start "npx tsx src/index.ts" --name seek-alert --cwd ~/apps/playground/seek-
 pm2 save
 pm2 startup
 ```
-Then execute `pm2 startup`. It will return a command. Copy and paste it and hit enter to run
+Then execute `pm2 startup`. It will return a command. Copy and paste it and hit enter to run.
 To check the status: `pm2 status`
