@@ -1,0 +1,24 @@
+name: Deploy seek-alert
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "seek-alert/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ~/apps/playground
+            git pull origin main
+            cd seek-alert
+            npm install
+            pm2 restart seek-alert
