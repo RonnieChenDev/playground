@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SEEK Job Analyser – Options</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f9fafb;
+      color: #111827;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 40px 16px;
+    }
+
+    .card {
+      background: white;
+      border-radius: 12px;
+      border: 1px solid #e5e7eb;
+      padding: 32px;
+      width: 100%;
+      max-width: 480px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.07);
+    }
+
+    h1 {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      color: #111827;
+    }
+
+    .subtitle {
+      font-size: 13px;
+      color: #6b7280;
+      margin-bottom: 28px;
+    }
+
+    .field {
+      margin-bottom: 20px;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: #374151;
+      margin-bottom: 6px;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+
+    input, select {
+      width: 100%;
+      padding: 9px 12px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 14px;
+      color: #111827;
+      background: white;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    input:focus, select:focus {
+      border-color: #6366f1;
+      box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+    }
+
+    input[type="password"] {
+      font-family: monospace;
+      letter-spacing: 0.05em;
+    }
+
+    .divider {
+      height: 1px;
+      background: #f3f4f6;
+      margin: 24px 0;
+    }
+
+    button[type="submit"] {
+      width: 100%;
+      padding: 10px;
+      background: #6366f1;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    button[type="submit"]:hover {
+      background: #4f46e5;
+    }
+
+    #status {
+      margin-top: 12px;
+      font-size: 13px;
+      font-weight: 500;
+      min-height: 18px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>SEEK Job Analyser</h1>
+    <p class="subtitle">Configure your profile so the extension can score job fit for you.</p>
+
+    <form id="options-form">
+      <div class="field">
+        <label for="api-key">Anthropic API Key</label>
+        <input
+          type="password"
+          id="api-key"
+          placeholder="sk-ant-..."
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <p class="hint">Get yours at console.anthropic.com — stored locally in your browser only.</p>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="field">
+        <label for="skills">Your Skills</label>
+        <input
+          type="text"
+          id="skills"
+          placeholder="C#, ASP.NET Core, React, PostgreSQL, TypeScript"
+        />
+        <p class="hint">Comma-separated. Be specific — this is what gets matched against job requirements.</p>
+      </div>
+
+      <div class="field">
+        <label for="experience">Experience Level</label>
+        <select id="experience">
+          <option value="junior">Junior (0–2 years)</option>
+          <option value="mid" selected>Mid (2–5 years)</option>
+          <option value="senior">Senior (5+ years)</option>
+        </select>
+      </div>
+
+      <button type="submit">Save Settings</button>
+      <div id="status"></div>
+    </form>
+  </div>
+
+  <script src="dist/options.js"></script>
+</body>
+</html>
