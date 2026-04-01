@@ -144,12 +144,33 @@
       </div>
 
       <div class="field">
-        <label for="experience">Experience Level</label>
-        <select id="experience">
-          <option value="junior">Junior (0–2 years)</option>
-          <option value="mid" selected>Mid (2–5 years)</option>
-          <option value="senior">Senior (5+ years)</option>
+        <label>Experience Level <span style="font-weight:400;color:#9ca3af">(select all that apply)</span></label>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
+            <input type="checkbox" name="experience" value="junior" style="width:auto;accent-color:#6366f1">
+            Junior (0–2 years)
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
+            <input type="checkbox" name="experience" value="mid" style="width:auto;accent-color:#6366f1">
+            Mid (2–5 years)
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
+            <input type="checkbox" name="experience" value="senior" style="width:auto;accent-color:#6366f1">
+            Senior (5+ years)
+          </label>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="visa-status">Your Visa / Work Rights</label>
+        <select id="visa-status">
+          <option value="citizen">Australian Citizen</option>
+          <option value="pr">Permanent Resident (PR)</option>
+          <option value="work_visa">Work Visa (e.g. 482, 407)</option>
+          <option value="student_visa" selected>Student Visa (e.g. 500)</option>
+          <option value="other">Other</option>
         </select>
+        <p class="hint">Used to assess whether you're eligible to apply.</p>
       </div>
 
       <button type="submit">Save Settings</button>
