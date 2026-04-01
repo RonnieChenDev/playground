@@ -1,0 +1,14 @@
+{
+  "name": "seek-job-analyser",
+  "version": "1.0.0",
+  "description": "Chrome extension: AI-powered inline job fit scoring on SEEK",
+  "scripts": {
+    "build": "esbuild src/background.ts src/content.ts --bundle --outdir=dist --platform=browser --target=chrome120 --format=esm && esbuild src/options.ts src/popup.ts --bundle --outdir=dist --platform=browser --target=chrome120 --format=iife",
+    "watch": "npm run build -- --watch"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "esbuild": "^0.20.2",
+    "typescript": "^5.4.5"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "SEEK Job Analyser",
+  "version": "1.0.0",
+  "description": "Analyses SEEK job listings and shows fit score inline",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://www.seek.com.au/*",
+    "https://api.anthropic.com/*"
+  ],
+  "background": {
+    "service_worker": "dist/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.seek.com.au/*"],
+      "js": ["dist/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html"
+}
