@@ -14,12 +14,62 @@ function createBadgeContainer(analysis: JobAnalysis): HTMLElement {
   const container = document.createElement("div");
   container.className = "sja-badge-container";
 
+  let fitScore = (
+    ["green", "yellow", "red"].includes(analysis.fitScore)
+      ? analysis.fitScore
+      : "yellow"
+  ) as "green" | "yellow" | "red";
+
+  const citizenshipRequired = (
+    ["citizen_only", "pr_or_citizen", "any_work_rights", "unknown"].includes(
+      analysis.citizenshipRequired,
+    )
+      ? analysis.citizenshipRequired
+      : "unknown"
+  ) as JobAnalysis["citizenshipRequired"];
+
+  const visaStatus = analysis.visaStatus;
+  if (
+    citizenshipRequired === "citizen_only" ||
+    (citizenshipRequired === "pr_or_citizen" &&
+      visaStatus !== "citizen" &&
+      visaStatus !== "pr")
+  ) {
+    fitScore = "red";
+  }
+
+  const experienceLevel = analysis.experienceLevel;
+  const candidateExp = Array.isArray(analysis.candidateExperience)
+    ? analysis.candidateExperience
+    : [analysis.candidateExperience ?? ""];
+  if (experienceLevel === "senior" && !candidateExp.includes("senior")) {
+    fitScore = "red";
+  }
+
   const colorMap = {
-    green: { bg: "#dcfce7", border: "#16a34a", text: "#15803d", dot: "#16a34a" },
-    yellow: { bg: "#fef9c3", border: "#ca8a04", text: "#a16207", dot: "#ca8a04" },
-    red: { bg: "#fee2e2", border: "#dc2626", text: "#b91c1c", dot: "#dc2626" }
+    green: {
+      bg: "#dcfce7",
+      border: "#16a34a",
+      text: "#15803d",
+      dot: "#16a34a",
+    },
+    yellow: {
+      bg: "#fef9c3",
+      border: "#ca8a04",
+      text: "#a16207",
+      dot: "#ca8a04",
+    },
+    red: { bg: "#fee2e2", border: "#dc2626", text: "#b91c1c", dot: "#dc2626" },
   };
-  const colors = colorMap[analysis.fitScore];
+  const colors = colorMap[fitScore];
+
+  const citizenshipMap = {
+    citizen_only: { text: "🔒 Citizens only", color: "#b91c1c" },
+    pr_or_citizen: { text: "🔒 PR or Citizen required", color: "#b91c1c" },
+    any_work_rights: { text: "✅ Any work rights accepted", color: "#15803d" },
+    unknown: { text: "🔍 Visa: not stated", color: "#6b7280" },
+  };
+  const cit = citizenshipMap[citizenshipRequired];
 
   const badge = document.createElement("div");
   badge.className = "sja-badge";
@@ -68,10 +118,10 @@ function createBadgeContainer(analysis: JobAnalysis): HTMLElement {
   `;
 
   const requiredHtml = analysis.requiredSkills
-    .map(s => `<span class="sja-skill sja-required">${s}</span>`)
+    .map((s) => `<span class="sja-skill sja-required">${s}</span>`)
     .join("");
   const niceHtml = analysis.niceToHaveSkills
-    .map(s => `<span class="sja-skill sja-nice">${s}</span>`)
+    .map((s) => `<span class="sja-skill sja-nice">${s}</span>`)
     .join("");
 
   detail.innerHTML = `
@@ -79,15 +129,22 @@ function createBadgeContainer(analysis: JobAnalysis): HTMLElement {
       <strong>Role:</strong> ${analysis.jobType} &nbsp;·&nbsp;
       <strong>Location:</strong> ${analysis.location}
     </div>
+    <div style="margin-bottom:6px;color:${cit.color};font-weight:500">
+      ${cit.text}
+    </div>
     <div style="margin-bottom:4px">
       <strong>Required:</strong><br/>
       <div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:4px">${requiredHtml}</div>
     </div>
-    ${niceHtml ? `
+    ${
+      niceHtml
+        ? `
     <div style="margin-top:6px">
       <strong>Nice to have:</strong><br/>
       <div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:4px">${niceHtml}</div>
-    </div>` : ""}
+    </div>`
+        : ""
+    }
   `;
 
   let expanded = false;

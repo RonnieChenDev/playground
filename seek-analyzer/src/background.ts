@@ -9,7 +9,8 @@ async function analyseJob(
   const prompt = `You are analysing a job listing for a candidate. Return ONLY a JSON object, no markdown, no explanation.
 
 Candidate's skills: ${request.userProfile.skills.join(", ")}
-Candidate's level: ${request.userProfile.experience}
+Candidate's level: ${Array.isArray(request.userProfile.experience) ? request.userProfile.experience.join(", ") : request.userProfile.experience}
+Candidate's visa status: ${request.userProfile.visaStatus}
 
 Job listing text:
 """
@@ -23,13 +24,34 @@ Return this exact JSON structure:
   "requiredSkills": ["skill1", "skill2"],
   "niceToHaveSkills": ["skill1", "skill2"],
   "fitScore": "green" | "yellow" | "red",
-  "fitReason": "one sentence explanation"
+  "fitReason": "one sentence explanation",
+  "citizenshipRequired": "yes" | "no" | "unknown",
+  "experienceLevel": "junior" | "mid" | "senior" | "unknown",
 }
 
 fitScore rules:
 - green: candidate matches 70%+ of required skills
-- yellow: candidate matches 40-69% of required skills  
-- red: candidate matches less than 40% of required skills`;
+- yellow: candidate matches 40-69% of required skills
+- red: candidate matches less than 40% of required skills
+
+location note:
+- Do NOT factor location into fitScore or fitReason. Assume the candidate is already searching in the right location.
+
+experienceLevel rules:
+- senior: listing explicitly requires 5+ years, "senior", "lead", "principal", or similar
+- mid: listing requires 2-5 years or "mid-level"
+- junior: listing is entry level, graduate, or junior
+- unknown: experience level not mentioned
+
+visa eligibility note:
+- If citizenshipRequired is citizen_only or pr_or_citizen, and candidate visa is work_visa or student_visa, reflect this ineligibility in fitScore (cap at yellow) and mention it in fitReason
+- If citizenshipRequired is citizen_only and candidate is pr, cap fitScore at yellow and mention it in fitReason
+
+citizenshipRequired rules:
+- citizen_only: listing explicitly requires Australian citizen only (e.g. security clearance, government roles, "must be Australian citizen")
+- pr_or_citizen: listing requires permanent resident OR citizen (e.g. "PR or citizen", "must have PR", "permanent residency required")
+- any_work_rights: listing accepts any valid work rights, all visa types welcome, sponsorship available, or does not restrict by visa/citizenship
+- unknown: visa or citizenship requirements are not mentioned at all`;
 
   const response = await fetch(ANTHROPIC_API_URL, {
     method: "POST",
@@ -37,13 +59,13 @@ fitScore rules:
       "Content-Type": "application/json",
       "x-api-key": apiKey,
       "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true"
+      "anthropic-dangerous-direct-browser-access": "true",
     },
     body: JSON.stringify({
       model: "claude-haiku-4-5",
       max_tokens: 500,
-      messages: [{ role: "user", content: prompt }]
-    })
+      messages: [{ role: "user", content: prompt }],
+    }),
   });
 
   if (!response.ok) {
@@ -53,8 +75,14 @@ fitScore rules:
 
   const data = await response.json();
   const text = data.content[0].text.trim();
-  const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
-  return JSON.parse(cleaned) as JobAnalysis;
+  const cleaned = text
+    .replace(/^```json\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+  const parsed = JSON.parse(cleaned) as JobAnalysis;
+  parsed.visaStatus = request.userProfile.visaStatus;
+  parsed.candidateExperience = request.userProfile.experience;
+  return parsed;
 }
 
 async function analyseJobWithRetry(
