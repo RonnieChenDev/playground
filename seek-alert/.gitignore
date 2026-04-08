@@ -1,4 +1,4 @@
 node_modules/
 dist/
 .env
-seen-jobs.json
+src/seen-jobs*.json
