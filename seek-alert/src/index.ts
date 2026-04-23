@@ -4,6 +4,8 @@ import * as nodemailer from "nodemailer";
 import "dotenv/config";
 import puppeteer from "puppeteer-core";
 
+let isChecking = false;
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface Job {
@@ -123,6 +125,14 @@ async function createBrowser() {
       "--disable-setuid-sandbox",
       "--disable-gpu",
       "--disable-dev-shm-usage",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--disable-sync",
+      "--disable-translate",
+      "--no-first-run",
+      "--single-process",
+      "--js-flags=--max-old-space-size=128",
     ],
   });
 }
@@ -131,8 +141,9 @@ async function createBrowser() {
 
 async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
   const jobs: Job[] = [];
+  let browser;
   try {
-    const browser = await createBrowser();
+    browser = await createBrowser();
     const page = await browser.newPage();
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -232,6 +243,8 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
     await browser.close();
   } catch (err) {
     console.error(`❌ [SEEK] Failed to fetch ${seekUrl}:`, err);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
   }
   return jobs;
 }
@@ -240,8 +253,9 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
 
 async function fetchIndeedJobs(indeedUrl: string): Promise<Job[]> {
   const jobs: Job[] = [];
+  let browser;
   try {
-    const browser = await createBrowser();
+    browser = await createBrowser();
     const page = await browser.newPage();
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -320,6 +334,8 @@ async function fetchIndeedJobs(indeedUrl: string): Promise<Job[]> {
     await browser.close();
   } catch (err) {
     console.error(`❌ [Indeed] Failed to fetch ${indeedUrl}:`, err);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
   }
   return jobs;
 }
@@ -486,11 +502,19 @@ async function startPlatform(
   await checkOnce(platform, urls, seenFile, config, seenIds);
 
   setInterval(async () => {
-    const now = new Date().toLocaleTimeString("en-AU", {
-      timeZone: "Australia/Perth",
-    });
-    console.log(`\n⏰ [${now}] [${platformLabel}] Running scheduled check...`);
-    await checkOnce(platform, urls, seenFile, config, seenIds);
+    if (isChecking) return;
+    isChecking = true;
+    try {
+      const now = new Date().toLocaleTimeString("en-AU", {
+        timeZone: "Australia/Perth",
+      });
+      console.log(
+        `\n⏰ [${now}] [${platformLabel}] Running scheduled check...`,
+      );
+      await checkOnce(platform, urls, seenFile, config, seenIds);
+    } finally {
+      isChecking = false;
+    }
   }, checkIntervalMs);
 }
 
@@ -499,7 +523,6 @@ async function startPlatform(
 async function main(): Promise<void> {
   const config = loadConfig();
 
-  // 两个平台独立启动，不互相等待
   if (config.seekUrls.length > 0) {
     startPlatform(
       "seek",
