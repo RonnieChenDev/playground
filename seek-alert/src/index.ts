@@ -262,6 +262,9 @@ async function fetchIndeedJobs(indeedUrl: string): Promise<Job[]> {
     );
     await page.goto(indeedUrl, { waitUntil: "networkidle2", timeout: 30000 });
 
+    const pageTitle = await page.title();
+    console.log(`   [Indeed] Page title: ${pageTitle}`);
+
     // Strategy 1: window mosaic data
     const mosaicData = await page.evaluate(() => {
       const w = window as any;
