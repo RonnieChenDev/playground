@@ -22,9 +22,7 @@ interface Config {
   emailAppPassword: string;
   emailTo: string;
   seekUrls: string[];
-  indeedUrls: string[];
   seekCheckIntervalMs: number;
-  indeedCheckIntervalMs: number;
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -37,16 +35,8 @@ function loadConfig(): Config {
     .split(",")
     .map((u) => u.trim())
     .filter(Boolean);
-  const indeedUrls = (process.env.INDEED_URLS ?? "")
-    .split(",")
-    .map((u) => u.trim())
-    .filter(Boolean);
   const seekInterval = parseInt(
     process.env.SEEK_CHECK_INTERVAL_MINUTES ?? "30",
-    10,
-  );
-  const indeedInterval = parseInt(
-    process.env.INDEED_CHECK_INTERVAL_MINUTES ?? "30",
     10,
   );
 
@@ -58,8 +48,8 @@ function loadConfig(): Config {
     console.error("❌ Set EMAIL_APP_PASSWORD in .env");
     process.exit(1);
   }
-  if (seekUrls.length === 0 && indeedUrls.length === 0) {
-    console.error("❌ Set at least one SEEK_URLS or INDEED_URLS in .env");
+  if (seekUrls.length === 0) {
+    console.error("❌ Set at least one SEEK_URLS in .env");
     process.exit(1);
   }
 
@@ -68,16 +58,13 @@ function loadConfig(): Config {
     emailAppPassword,
     emailTo: emailTo || emailUser,
     seekUrls,
-    indeedUrls,
-    seekCheckIntervalMs: seekInterval * 60 * 1000,
-    indeedCheckIntervalMs: indeedInterval * 60 * 1000,
+    seekCheckIntervalMs: seekInterval * 60 * 1000
   };
 }
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
 const SEEK_SEEN_FILE = path.join(__dirname, "seen-jobs-seek.json");
-const INDEED_SEEN_FILE = path.join(__dirname, "seen-jobs-indeed.json");
 
 function loadSeenIds(file: string): Set<string> {
   try {
@@ -249,100 +236,6 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
   return jobs;
 }
 
-// ─── Indeed Fetcher ───────────────────────────────────────────────────────────
-
-async function fetchIndeedJobs(indeedUrl: string): Promise<Job[]> {
-  const jobs: Job[] = [];
-  let browser;
-  try {
-    browser = await createBrowser();
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    );
-    await page.goto(indeedUrl, { waitUntil: "networkidle2", timeout: 30000 });
-
-    const pageTitle = await page.title();
-    console.log(`   [Indeed] Page title: ${pageTitle}`);
-
-    // Strategy 1: window mosaic data
-    const mosaicData = await page.evaluate(() => {
-      const w = window as any;
-      const provider = w["mosaic-provider-jobcards"];
-      return provider?.model?.results ?? null;
-    });
-
-    if (Array.isArray(mosaicData)) {
-      for (const item of mosaicData) {
-        const id = item.jobkey ?? "";
-        if (!id) continue;
-        jobs.push({
-          id,
-          title: item.displayTitle ?? item.title ?? "",
-          company: item.company ?? "",
-          location: item.formattedLocation ?? item.location ?? "",
-          url: `https://au.indeed.com/viewjob?jk=${id}`,
-          listedAt: item.pubDate ?? item.formattedRelativeTime ?? "",
-        });
-      }
-    }
-
-    // Strategy 2: DOM fallback
-    if (jobs.length === 0) {
-      const domJobs = await page.evaluate(() => {
-        const results: Array<{
-          id: string;
-          title: string;
-          company: string;
-          location: string;
-          url: string;
-          listedAt: string;
-        }> = [];
-        const cards = document.querySelectorAll("[data-jk]");
-        cards.forEach((card) => {
-          const el = card as HTMLElement;
-          const id = el.getAttribute("data-jk") ?? "";
-          if (!id) return;
-          const title =
-            el
-              .querySelector('[data-testid="job-title"] span, h2 a span')
-              ?.textContent?.trim() ?? "";
-          const company =
-            el
-              .querySelector('[data-testid="company-name"]')
-              ?.textContent?.trim() ?? "";
-          const location =
-            el
-              .querySelector('[data-testid="text-location"]')
-              ?.textContent?.trim() ?? "";
-          const listedAt =
-            el
-              .querySelector('[data-testid="myJobsStateDate"]')
-              ?.textContent?.trim() ?? "";
-          results.push({
-            id,
-            title: title || "Unknown Title",
-            company: company || "Unknown Company",
-            location: location || "",
-            url: `https://au.indeed.com/viewjob?jk=${id}`,
-            listedAt: listedAt || "Recently",
-          });
-        });
-        return results;
-      });
-      jobs.push(...domJobs);
-    }
-
-    await page.close();
-    await browser.close();
-  } catch (err) {
-    console.error(`❌ [Indeed] Failed to fetch ${indeedUrl}:`, err);
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-  return jobs;
-}
-
 // ─── Email Notifier ───────────────────────────────────────────────────────────
 
 function createTransporter(config: Config) {
@@ -363,10 +256,8 @@ async function sendJobEmail(
   config: Config,
   jobs: Job[],
   searchLabel: string,
-  platform: "seek" | "indeed",
 ): Promise<void> {
   const transporter = createTransporter(config);
-  const platformLabel = platform === "seek" ? "SEEK" : "Indeed";
 
   const jobRows = jobs
     .map(
@@ -396,52 +287,37 @@ async function sendJobEmail(
       </thead>
       <tbody>${jobRows}</tbody>
     </table>
-    <p style="color:#999;font-size:12px;margin-top:16px">Sent by ${platformLabel} Job Alert</p>
+    <p style="color:#999;font-size:12px;margin-top:16px">Sent by SEEK Job Alert</p>
   `;
 
   try {
     await transporter.sendMail({
       from: config.emailUser,
       to: config.emailTo,
-      subject: `🔔 ${platformLabel}: ${jobs.length} new ${jobs.length === 1 ? "job" : "jobs"} — ${searchLabel}`,
+      subject: `🔔 SEEK: ${jobs.length} new ${jobs.length === 1 ? "job" : "jobs"} — ${searchLabel}`,
       html,
     });
   } catch (err) {
-    console.error(`❌ [${platformLabel}] Failed to send email:`, err);
+    console.error("❌ Failed to send email:", err);
   }
 }
 
 // ─── Check Loop ───────────────────────────────────────────────────────────────
 
 async function checkOnce(
-  platform: "seek" | "indeed",
   urls: string[],
   seenFile: string,
   config: Config,
   seenIds: Set<string>,
 ): Promise<void> {
   for (const url of urls) {
-    const label =
-      platform === "seek"
-        ? decodeURIComponent(
-            url.replace("https://www.seek.com.au/", "").replace(/\//g, " › "),
-          )
-        : (() => {
-            try {
-              return decodeURIComponent(
-                new URL(url).searchParams.get("q") ?? url,
-              );
-            } catch {
-              return url;
-            }
-          })();
+    const label = decodeURIComponent(
+      url.replace("https://www.seek.com.au/", "").replace(/\//g, " › "),
+    );
 
-    console.log(`🔍 [${platform.toUpperCase()}] Checking: ${label}`);
+    console.log(`🔍 [SEEK] Checking: ${label}`);
 
-    const jobs =
-      platform === "seek"
-        ? await fetchSeekJobs(url)
-        : await fetchIndeedJobs(url);
+    const jobs = await fetchSeekJobs(url);
 
     console.log(`   Found ${jobs.length} jobs`);
 
@@ -453,7 +329,7 @@ async function checkOnce(
     }
 
     if (newJobs.length > 0) {
-      await sendJobEmail(config, newJobs, label, platform);
+      await sendJobEmail(config, newJobs, label);
       console.log(`🎉 Emailed ${newJobs.length} new job(s)!`);
     } else {
       console.log("✅ No new jobs for this search.");
@@ -467,17 +343,15 @@ async function checkOnce(
 
 // ─── Platform Runner ──────────────────────────────────────────────────────────
 
-async function startPlatform(
-  platform: "seek" | "indeed",
+async function startSeekMonitor(
   urls: string[],
   seenFile: string,
   checkIntervalMs: number,
   config: Config,
 ): Promise<void> {
-  const platformLabel = platform === "seek" ? "SEEK" : "Indeed";
   const seenIds = loadSeenIds(seenFile);
 
-  console.log(`🚀 ${platformLabel} Job Alert started`);
+  console.log("🚀 SEEK Job Alert started");
   console.log(
     `   Monitoring ${urls.length} search(es), every ${checkIntervalMs / 60000} minutes`,
   );
@@ -486,13 +360,10 @@ async function startPlatform(
 
   if (seenIds.size === 0) {
     console.log(
-      `📝 [${platformLabel}] First run — marking existing jobs as seen (no emails sent)`,
+      "📝 [SEEK] First run — marking existing jobs as seen (no emails sent)",
     );
     for (const url of urls) {
-      const jobs =
-        platform === "seek"
-          ? await fetchSeekJobs(url)
-          : await fetchIndeedJobs(url);
+      const jobs = await fetchSeekJobs(url);
       for (const job of jobs) {
         if (job.id) seenIds.add(job.id);
       }
@@ -502,7 +373,7 @@ async function startPlatform(
     console.log(`   Marked ${seenIds.size} existing jobs as seen.\n`);
   }
 
-  await checkOnce(platform, urls, seenFile, config, seenIds);
+  await checkOnce(urls, seenFile, config, seenIds);
 
   setInterval(async () => {
     if (isChecking) return;
@@ -511,10 +382,8 @@ async function startPlatform(
       const now = new Date().toLocaleTimeString("en-AU", {
         timeZone: "Australia/Perth",
       });
-      console.log(
-        `\n⏰ [${now}] [${platformLabel}] Running scheduled check...`,
-      );
-      await checkOnce(platform, urls, seenFile, config, seenIds);
+      console.log(`\n⏰ [${now}] [SEEK] Running scheduled check...`);
+      await checkOnce(urls, seenFile, config, seenIds);
     } finally {
       isChecking = false;
     }
@@ -526,29 +395,12 @@ async function startPlatform(
 async function main(): Promise<void> {
   const config = loadConfig();
 
-  if (config.seekUrls.length > 0) {
-    startPlatform(
-      "seek",
-      config.seekUrls,
-      SEEK_SEEN_FILE,
-      config.seekCheckIntervalMs,
-      config,
-    );
-  } else {
-    console.log("⚠️  No SEEK_URLS set, skipping SEEK.");
-  }
-
-  if (config.indeedUrls.length > 0) {
-    startPlatform(
-      "indeed",
-      config.indeedUrls,
-      INDEED_SEEN_FILE,
-      config.indeedCheckIntervalMs,
-      config,
-    );
-  } else {
-    console.log("⚠️  No INDEED_URLS set, skipping Indeed.");
-  }
+  await startSeekMonitor(
+    config.seekUrls,
+    SEEK_SEEN_FILE,
+    config.seekCheckIntervalMs,
+    config,
+  );
 }
 
 main().catch(console.error);
