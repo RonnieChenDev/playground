@@ -31,6 +31,7 @@ interface Profile {
   emailTo: string;
   seekUrls: string[];
   seekCheckIntervalMs: number;
+  titleExcludeKeywords?: string[];
   aiFilter?: AiFilterConfig;
 }
 
@@ -79,6 +80,9 @@ function loadConfig(): AppConfig {
         .map((u: string) => u.trim())
         .filter(Boolean),
       seekCheckIntervalMs: (p.seekCheckIntervalMinutes ?? 30) * 60 * 1000,
+      titleExcludeKeywords: (p.titleExcludeKeywords ?? [])
+        .map((k: string) => String(k).trim())
+        .filter(Boolean),
       aiFilter: p.aiFilter
         ? {
             enabled: Boolean(p.aiFilter.enabled),
@@ -148,6 +152,7 @@ function saveSeenIds(ids: Set<string>, file: string): void {
 
 interface RejectedJob extends Job {
   reason: string;
+  filteredBy: "keyword" | "ai";
   rejectedAt: string;
 }
 
@@ -505,6 +510,7 @@ async function checkOnce(
   seenIds: Set<string>,
   rejectedIds: Set<string>,
   rejectedJobs: RejectedJob[],
+  titleExcludeKeywords: string[] | undefined,
   aiFilter: AiFilterConfig | undefined,
   anthropicApiKey: string | undefined,
 ): Promise<void> {
@@ -518,23 +524,58 @@ async function checkOnce(
     const jobs = await fetchSeekJobs(url);
     console.log(`   Found ${jobs.length} jobs`);
 
-    // 去重要同时排除"已推送"和"已被 AI 拒绝"两个列表
+    // 去重要同时排除"已推送"和"已被过滤（关键词/AI）"两个列表
     const newJobs = jobs.filter(
       (job) => job.id && !seenIds.has(job.id) && !rejectedIds.has(job.id),
     );
 
-    let jobsToSend: Job[] = newJobs;
-    let rejectedThisRun = 0;
+    // 第一步：标题关键词粗筛（大小写不敏感的模糊匹配），命中直接排除，不进 AI
+    let remainingJobs: Job[] = newJobs;
+    let keywordRejectedThisRun = 0;
+    if (
+      titleExcludeKeywords &&
+      titleExcludeKeywords.length > 0 &&
+      newJobs.length > 0
+    ) {
+      const lowerKeywords = titleExcludeKeywords.map((k) => k.toLowerCase());
+      remainingJobs = [];
+      for (const job of newJobs) {
+        const titleLower = job.title.toLowerCase();
+        const matched = lowerKeywords.find((k) => titleLower.includes(k));
+        if (matched) {
+          console.log(
+            `🚫 [Keyword] Excluded "${job.title}": matched "${matched}"`,
+          );
+          rejectedJobs.push({
+            ...job,
+            reason: `职位名命中排除关键词: "${matched}"`,
+            filteredBy: "keyword",
+            rejectedAt: new Date().toISOString(),
+          });
+          rejectedIds.add(job.id);
+          keywordRejectedThisRun++;
+        } else {
+          remainingJobs.push(job);
+        }
+      }
+      if (keywordRejectedThisRun > 0)
+        saveRejectedJobs(rejectedJobs, rejectedFile);
+    }
 
-    if (aiFilter?.enabled && newJobs.length > 0) {
+    // 第二步：AI 过滤（只处理关键词筛过之后剩下的职位）
+    let jobsToSend: Job[] = remainingJobs;
+    let aiRejectedThisRun = 0;
+
+    if (aiFilter?.enabled && remainingJobs.length > 0) {
       if (!anthropicApiKey) {
         console.error(
           "⚠️  aiFilter.enabled=true but ANTHROPIC_API_KEY missing; sending without AI filtering.",
         );
       } else {
         jobsToSend = [];
-        const descriptions = await fetchJobDescriptionsForNewJobs(newJobs);
-        for (const job of newJobs) {
+        const descriptions =
+          await fetchJobDescriptionsForNewJobs(remainingJobs);
+        for (const job of remainingJobs) {
           try {
             const result = await classifyJobWithClaude(
               anthropicApiKey,
@@ -548,10 +589,11 @@ async function checkOnce(
               rejectedJobs.push({
                 ...job,
                 reason: result.reason,
+                filteredBy: "ai",
                 rejectedAt: new Date().toISOString(),
               });
               rejectedIds.add(job.id);
-              rejectedThisRun++;
+              aiRejectedThisRun++;
             } else {
               jobsToSend.push(job);
             }
@@ -564,7 +606,8 @@ async function checkOnce(
           }
           await new Promise((r) => setTimeout(r, 1000));
         }
-        if (rejectedThisRun > 0) saveRejectedJobs(rejectedJobs, rejectedFile);
+        if (aiRejectedThisRun > 0)
+          saveRejectedJobs(rejectedJobs, rejectedFile);
       }
     }
 
@@ -573,11 +616,11 @@ async function checkOnce(
     if (jobsToSend.length > 0) {
       await sendJobEmail(smtp, emailTo, jobsToSend, label);
       console.log(
-        `🎉 Emailed ${jobsToSend.length} new job(s)! (${rejectedThisRun} filtered out by AI)`,
+        `🎉 Emailed ${jobsToSend.length} new job(s)! (${keywordRejectedThisRun} by keyword, ${aiRejectedThisRun} by AI)`,
       );
     } else if (newJobs.length > 0) {
       console.log(
-        `✅ ${newJobs.length} new job(s) found, all filtered out by AI.`,
+        `✅ ${newJobs.length} new job(s) found, all filtered out (${keywordRejectedThisRun} by keyword, ${aiRejectedThisRun} by AI).`,
       );
     } else {
       console.log("✅ No new jobs for this search.");
@@ -608,6 +651,11 @@ async function startSeekMonitor(
     `   Monitoring ${profile.seekUrls.length} search(es), every ${profile.seekCheckIntervalMs / 60000} minutes`,
   );
   console.log(`   Alerts → ${profile.emailTo}`);
+  if (profile.titleExcludeKeywords && profile.titleExcludeKeywords.length > 0) {
+    console.log(
+      `   🔤 Title keyword filter: ${profile.titleExcludeKeywords.join(", ")}`,
+    );
+  }
   if (profile.aiFilter?.enabled) {
     console.log(
       `   🤖 AI filter enabled (model: ${profile.aiFilter.model ?? DEFAULT_CLAUDE_MODEL})`,
@@ -641,6 +689,7 @@ async function startSeekMonitor(
     seenIds,
     rejectedIds,
     rejectedJobs,
+    profile.titleExcludeKeywords,
     profile.aiFilter,
     anthropicApiKey,
   );
@@ -664,6 +713,7 @@ async function startSeekMonitor(
         seenIds,
         rejectedIds,
         rejectedJobs,
+        profile.titleExcludeKeywords,
         profile.aiFilter,
         anthropicApiKey,
       );
