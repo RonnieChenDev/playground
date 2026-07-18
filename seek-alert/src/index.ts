@@ -36,8 +36,11 @@ interface Profile {
 
 interface AppConfig {
   smtp: SmtpConfig;
+  anthropicApiKey?: string;
   profiles: Profile[];
 }
+
+const DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -103,7 +106,15 @@ function loadConfig(): AppConfig {
     process.exit(1);
   }
 
-  return { smtp: { emailUser, emailAppPassword }, profiles };
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  const needsAi = profiles.some((p) => p.aiFilter?.enabled);
+  if (needsAi && !anthropicApiKey) {
+    console.warn(
+      "⚠️  Some profiles have aiFilter.enabled=true but ANTHROPIC_API_KEY is missing in .env — AI filtering will be skipped for them.",
+    );
+  }
+
+  return { smtp: { emailUser, emailAppPassword }, anthropicApiKey, profiles };
 }
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
@@ -133,6 +144,30 @@ function loadSeenIds(file: string): Set<string> {
 
 function saveSeenIds(ids: Set<string>, file: string): void {
   fs.writeFileSync(file, JSON.stringify([...ids], null, 2));
+}
+
+interface RejectedJob extends Job {
+  reason: string;
+  rejectedAt: string;
+}
+
+function rejectedFileFor(profileName: string): string {
+  return path.join(
+    DATA_DIR,
+    `rejected-jobs-seek-${sanitizeFileName(profileName)}.json`,
+  );
+}
+
+function loadRejectedJobs(file: string): RejectedJob[] {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch {
+    return [];
+  }
+}
+
+function saveRejectedJobs(jobs: RejectedJob[], file: string): void {
+  fs.writeFileSync(file, JSON.stringify(jobs, null, 2));
 }
 
 // ─── Browser ─────────────────────────────────────────────────────────────────
@@ -292,6 +327,106 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
   return jobs;
 }
 
+async function fetchJobDescriptionsForNewJobs(
+  jobs: Job[],
+): Promise<Map<string, string>> {
+  const descriptions = new Map<string, string>();
+  if (jobs.length === 0) return descriptions;
+
+  let browser;
+  try {
+    browser = await createBrowser();
+    for (const job of jobs) {
+      const page = await browser.newPage();
+      try {
+        await page.setUserAgent(
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        );
+        await page.goto(job.url, {
+          waitUntil: "networkidle2",
+          timeout: 30000,
+        });
+        const description = await page.evaluate(() => {
+          const el =
+            document.querySelector('[data-automation="jobAdDetails"]') ??
+            document.querySelector('[data-testid="jobAdDetails"]') ??
+            document.querySelector("article");
+          return el?.textContent?.trim() ?? "";
+        });
+        descriptions.set(job.id, description);
+      } catch (err) {
+        console.error(`❌ Failed to fetch description for ${job.url}:`, err);
+        descriptions.set(job.id, "");
+      } finally {
+        await page.close();
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+  return descriptions;
+}
+
+// ─── AI Filter ────────────────────────────────────────────────────────────────
+
+interface ClassifyResult {
+  reject: boolean;
+  reason: string;
+}
+
+async function classifyJobWithClaude(
+  apiKey: string,
+  model: string,
+  unwantedCriteria: string[],
+  job: Job,
+  description: string,
+): Promise<ClassifyResult> {
+  const systemPrompt = `你是一个求职助手，帮用户筛掉不想看到的职位。
+用户不想要满足以下任一条件的职位（命中任意一条就应该 reject: true）：
+${unwantedCriteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}
+
+只输出严格 JSON，不要有任何多余文字、不要用 markdown 代码块包裹：
+{"reject": boolean, "reason": string}`;
+
+  const userContent = `职位标题：${job.title}
+公司：${job.company}
+地点：${job.location}
+职位描述：
+${description || "(未能获取详情描述，仅凭标题/公司判断)"}`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 200,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userContent }],
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Claude API error ${res.status}: ${errText}`);
+  }
+
+  const data: any = await res.json();
+  const text = data?.content?.[0]?.text ?? "";
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error(`Unexpected Claude response: ${text}`);
+
+  const parsed = JSON.parse(jsonMatch[0]);
+  return {
+    reject: Boolean(parsed.reject),
+    reason: String(parsed.reason ?? ""),
+  };
+}
+
 // ─── Email Notifier ───────────────────────────────────────────────────────────
 
 function createTransporter(smtp: SmtpConfig) {
@@ -364,9 +499,14 @@ async function sendJobEmail(
 async function checkOnce(
   urls: string[],
   seenFile: string,
+  rejectedFile: string,
   smtp: SmtpConfig,
   emailTo: string,
   seenIds: Set<string>,
+  rejectedIds: Set<string>,
+  rejectedJobs: RejectedJob[],
+  aiFilter: AiFilterConfig | undefined,
+  anthropicApiKey: string | undefined,
 ): Promise<void> {
   for (const url of urls) {
     const label = decodeURIComponent(
@@ -376,19 +516,69 @@ async function checkOnce(
     console.log(`🔍 [SEEK] Checking: ${label}`);
 
     const jobs = await fetchSeekJobs(url);
-
     console.log(`   Found ${jobs.length} jobs`);
 
-    const newJobs: Job[] = [];
-    for (const job of jobs) {
-      if (!job.id || seenIds.has(job.id)) continue;
-      seenIds.add(job.id);
-      newJobs.push(job);
+    // 去重要同时排除"已推送"和"已被 AI 拒绝"两个列表
+    const newJobs = jobs.filter(
+      (job) => job.id && !seenIds.has(job.id) && !rejectedIds.has(job.id),
+    );
+
+    let jobsToSend: Job[] = newJobs;
+    let rejectedThisRun = 0;
+
+    if (aiFilter?.enabled && newJobs.length > 0) {
+      if (!anthropicApiKey) {
+        console.error(
+          "⚠️  aiFilter.enabled=true but ANTHROPIC_API_KEY missing; sending without AI filtering.",
+        );
+      } else {
+        jobsToSend = [];
+        const descriptions = await fetchJobDescriptionsForNewJobs(newJobs);
+        for (const job of newJobs) {
+          try {
+            const result = await classifyJobWithClaude(
+              anthropicApiKey,
+              aiFilter.model ?? DEFAULT_CLAUDE_MODEL,
+              aiFilter.unwantedCriteria,
+              job,
+              descriptions.get(job.id) ?? "",
+            );
+            if (result.reject) {
+              console.log(`🚫 [AI] Rejected "${job.title}": ${result.reason}`);
+              rejectedJobs.push({
+                ...job,
+                reason: result.reason,
+                rejectedAt: new Date().toISOString(),
+              });
+              rejectedIds.add(job.id);
+              rejectedThisRun++;
+            } else {
+              jobsToSend.push(job);
+            }
+          } catch (err) {
+            console.error(
+              `❌ [AI] Classify failed for "${job.title}", sending without filtering:`,
+              err,
+            );
+            jobsToSend.push(job);
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        if (rejectedThisRun > 0) saveRejectedJobs(rejectedJobs, rejectedFile);
+      }
     }
 
-    if (newJobs.length > 0) {
-      await sendJobEmail(smtp, emailTo, newJobs, label);
-      console.log(`🎉 Emailed ${newJobs.length} new job(s)!`);
+    for (const job of jobsToSend) seenIds.add(job.id);
+
+    if (jobsToSend.length > 0) {
+      await sendJobEmail(smtp, emailTo, jobsToSend, label);
+      console.log(
+        `🎉 Emailed ${jobsToSend.length} new job(s)! (${rejectedThisRun} filtered out by AI)`,
+      );
+    } else if (newJobs.length > 0) {
+      console.log(
+        `✅ ${newJobs.length} new job(s) found, all filtered out by AI.`,
+      );
     } else {
       console.log("✅ No new jobs for this search.");
     }
@@ -404,9 +594,13 @@ async function checkOnce(
 async function startSeekMonitor(
   profile: Profile,
   smtp: SmtpConfig,
+  anthropicApiKey: string | undefined,
 ): Promise<void> {
   const seenFile = seenFileFor(profile.name);
+  const rejectedFile = rejectedFileFor(profile.name);
   const seenIds = loadSeenIds(seenFile);
+  const rejectedJobs = loadRejectedJobs(rejectedFile);
+  const rejectedIds = new Set(rejectedJobs.map((j) => j.id));
   let isChecking = false;
 
   console.log(`🚀 SEEK Job Alert started for "${profile.name}"`);
@@ -414,9 +608,16 @@ async function startSeekMonitor(
     `   Monitoring ${profile.seekUrls.length} search(es), every ${profile.seekCheckIntervalMs / 60000} minutes`,
   );
   console.log(`   Alerts → ${profile.emailTo}`);
-  console.log(`   ${seenIds.size} previously seen jobs loaded\n`);
+  if (profile.aiFilter?.enabled) {
+    console.log(
+      `   🤖 AI filter enabled (model: ${profile.aiFilter.model ?? DEFAULT_CLAUDE_MODEL})`,
+    );
+  }
+  console.log(
+    `   ${seenIds.size} previously seen, ${rejectedIds.size} previously rejected\n`,
+  );
 
-  if (seenIds.size === 0) {
+  if (seenIds.size === 0 && rejectedIds.size === 0) {
     console.log(
       `📝 [SEEK:${profile.name}] First run — marking existing jobs as seen (no emails sent)`,
     );
@@ -431,7 +632,18 @@ async function startSeekMonitor(
     console.log(`   Marked ${seenIds.size} existing jobs as seen.\n`);
   }
 
-  await checkOnce(profile.seekUrls, seenFile, smtp, profile.emailTo, seenIds);
+  await checkOnce(
+    profile.seekUrls,
+    seenFile,
+    rejectedFile,
+    smtp,
+    profile.emailTo,
+    seenIds,
+    rejectedIds,
+    rejectedJobs,
+    profile.aiFilter,
+    anthropicApiKey,
+  );
 
   setInterval(async () => {
     if (isChecking) return;
@@ -446,9 +658,14 @@ async function startSeekMonitor(
       await checkOnce(
         profile.seekUrls,
         seenFile,
+        rejectedFile,
         smtp,
         profile.emailTo,
         seenIds,
+        rejectedIds,
+        rejectedJobs,
+        profile.aiFilter,
+        anthropicApiKey,
       );
     } finally {
       isChecking = false;
@@ -459,10 +676,10 @@ async function startSeekMonitor(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const { smtp, profiles } = loadConfig();
+  const { smtp, anthropicApiKey, profiles } = loadConfig();
 
   for (const profile of profiles) {
-    startSeekMonitor(profile, smtp).catch((err) =>
+    startSeekMonitor(profile, smtp, anthropicApiKey).catch((err) =>
       console.error(`❌ [SEEK:${profile.name}] monitor crashed:`, err),
     );
   }
