@@ -4,8 +4,6 @@ import * as nodemailer from "nodemailer";
 import "dotenv/config";
 import puppeteer from "puppeteer-core";
 
-let isChecking = false;
-
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface Job {
@@ -17,28 +15,35 @@ interface Job {
   listedAt: string;
 }
 
-interface Config {
+interface SmtpConfig {
   emailUser: string;
   emailAppPassword: string;
+}
+
+interface AiFilterConfig {
+  enabled: boolean;
+  model?: string;
+  unwantedCriteria: string[];
+}
+
+interface Profile {
+  name: string;
   emailTo: string;
   seekUrls: string[];
   seekCheckIntervalMs: number;
+  aiFilter?: AiFilterConfig;
+}
+
+interface AppConfig {
+  smtp: SmtpConfig;
+  profiles: Profile[];
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-function loadConfig(): Config {
+function loadConfig(): AppConfig {
   const emailUser = process.env.EMAIL_USER ?? "";
   const emailAppPassword = process.env.EMAIL_APP_PASSWORD ?? "";
-  const emailTo = process.env.EMAIL_TO ?? "";
-  const seekUrls = (process.env.SEEK_URLS ?? "")
-    .split(",")
-    .map((u) => u.trim())
-    .filter(Boolean);
-  const seekInterval = parseInt(
-    process.env.SEEK_CHECK_INTERVAL_MINUTES ?? "30",
-    10,
-  );
 
   if (!emailUser || emailUser === "yourname@gmail.com") {
     console.error("❌ Set EMAIL_USER in .env");
@@ -48,23 +53,74 @@ function loadConfig(): Config {
     console.error("❌ Set EMAIL_APP_PASSWORD in .env");
     process.exit(1);
   }
-  if (seekUrls.length === 0) {
-    console.error("❌ Set at least one SEEK_URLS in .env");
+
+  const configPath = path.resolve(
+    __dirname,
+    "..",
+    process.env.CONFIG_PATH ?? "config.json",
+  );
+
+  let raw: any;
+  try {
+    raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch (err) {
+    console.error(`❌ Failed to read config file at ${configPath}:`, err);
     process.exit(1);
   }
 
-  return {
-    emailUser,
-    emailAppPassword,
-    emailTo: emailTo || emailUser,
-    seekUrls,
-    seekCheckIntervalMs: seekInterval * 60 * 1000
-  };
+  const profiles: Profile[] = (raw.profiles ?? [])
+    .map((p: any) => ({
+      name: String(p.name ?? "").trim(),
+      emailTo: String(p.emailTo ?? "").trim(),
+      seekUrls: (p.seekUrls ?? [])
+        .map((u: string) => u.trim())
+        .filter(Boolean),
+      seekCheckIntervalMs: (p.seekCheckIntervalMinutes ?? 30) * 60 * 1000,
+      aiFilter: p.aiFilter
+        ? {
+            enabled: Boolean(p.aiFilter.enabled),
+            model: p.aiFilter.model,
+            unwantedCriteria: p.aiFilter.unwantedCriteria ?? [],
+          }
+        : undefined,
+    }))
+    .filter((p: Profile) => {
+      if (!p.name || !p.emailTo) {
+        console.error(
+          "❌ Each profile needs 'name' and 'emailTo'; skipping invalid entry.",
+        );
+        return false;
+      }
+      if (p.seekUrls.length === 0) {
+        console.log(`⚠️  Profile "${p.name}" has no seekUrls, skipping.`);
+        return false;
+      }
+      return true;
+    });
+
+  if (profiles.length === 0) {
+    console.error("❌ No valid profile with seekUrls found in config.json");
+    process.exit(1);
+  }
+
+  return { smtp: { emailUser, emailAppPassword }, profiles };
 }
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const SEEK_SEEN_FILE = path.join(__dirname, "seen-jobs-seek.json");
+const DATA_DIR = path.join(__dirname, "data");
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function sanitizeFileName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function seenFileFor(profileName: string): string {
+  return path.join(
+    DATA_DIR,
+    `seen-jobs-seek-${sanitizeFileName(profileName)}.json`,
+  );
+}
 
 function loadSeenIds(file: string): Set<string> {
   try {
@@ -162,7 +218,7 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
           title: item.title ?? item.jobTitle ?? "",
           company: item.advertiser?.description ?? item.companyName ?? "",
           location: item.location ?? item.suburb ?? "",
-          url: `https://www.seek.com.au/job/${id}`,
+          url: `https://au.seek.com/job/${id}`,
           listedAt: item.listedAt ?? item.listingDate ?? "",
         });
       }
@@ -216,7 +272,7 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
               location: location || "Perth WA",
               url: href.startsWith("http")
                 ? href
-                : `https://www.seek.com.au${href}`,
+                : `https://au.seek.com${href}`,
               listedAt: listedAt || "Recently",
             });
           }
@@ -238,10 +294,10 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
 
 // ─── Email Notifier ───────────────────────────────────────────────────────────
 
-function createTransporter(config: Config) {
+function createTransporter(smtp: SmtpConfig) {
   return nodemailer.createTransport({
     service: "gmail",
-    auth: { user: config.emailUser, pass: config.emailAppPassword },
+    auth: { user: smtp.emailUser, pass: smtp.emailAppPassword },
   });
 }
 
@@ -253,11 +309,12 @@ function escapeHtml(text: string): string {
 }
 
 async function sendJobEmail(
-  config: Config,
+  smtp: SmtpConfig,
+  emailTo: string,
   jobs: Job[],
   searchLabel: string,
 ): Promise<void> {
-  const transporter = createTransporter(config);
+  const transporter = createTransporter(smtp);
 
   const jobRows = jobs
     .map(
@@ -292,8 +349,8 @@ async function sendJobEmail(
 
   try {
     await transporter.sendMail({
-      from: config.emailUser,
-      to: config.emailTo,
+      from: smtp.emailUser,
+      to: emailTo,
       subject: `🔔 SEEK: ${jobs.length} new ${jobs.length === 1 ? "job" : "jobs"} — ${searchLabel}`,
       html,
     });
@@ -307,12 +364,13 @@ async function sendJobEmail(
 async function checkOnce(
   urls: string[],
   seenFile: string,
-  config: Config,
+  smtp: SmtpConfig,
+  emailTo: string,
   seenIds: Set<string>,
 ): Promise<void> {
   for (const url of urls) {
     const label = decodeURIComponent(
-      url.replace("https://www.seek.com.au/", "").replace(/\//g, " › "),
+      url.replace("https://au.seek.com/", "").replace(/\//g, " › "),
     );
 
     console.log(`🔍 [SEEK] Checking: ${label}`);
@@ -329,7 +387,7 @@ async function checkOnce(
     }
 
     if (newJobs.length > 0) {
-      await sendJobEmail(config, newJobs, label);
+      await sendJobEmail(smtp, emailTo, newJobs, label);
       console.log(`🎉 Emailed ${newJobs.length} new job(s)!`);
     } else {
       console.log("✅ No new jobs for this search.");
@@ -341,28 +399,28 @@ async function checkOnce(
   saveSeenIds(seenIds, seenFile);
 }
 
-// ─── Platform Runner ──────────────────────────────────────────────────────────
+// ─── Profile Runner ───────────────────────────────────────────────────────────
 
 async function startSeekMonitor(
-  urls: string[],
-  seenFile: string,
-  checkIntervalMs: number,
-  config: Config,
+  profile: Profile,
+  smtp: SmtpConfig,
 ): Promise<void> {
+  const seenFile = seenFileFor(profile.name);
   const seenIds = loadSeenIds(seenFile);
+  let isChecking = false;
 
-  console.log("🚀 SEEK Job Alert started");
+  console.log(`🚀 SEEK Job Alert started for "${profile.name}"`);
   console.log(
-    `   Monitoring ${urls.length} search(es), every ${checkIntervalMs / 60000} minutes`,
+    `   Monitoring ${profile.seekUrls.length} search(es), every ${profile.seekCheckIntervalMs / 60000} minutes`,
   );
-  console.log(`   Alerts → ${config.emailTo}`);
+  console.log(`   Alerts → ${profile.emailTo}`);
   console.log(`   ${seenIds.size} previously seen jobs loaded\n`);
 
   if (seenIds.size === 0) {
     console.log(
-      "📝 [SEEK] First run — marking existing jobs as seen (no emails sent)",
+      `📝 [SEEK:${profile.name}] First run — marking existing jobs as seen (no emails sent)`,
     );
-    for (const url of urls) {
+    for (const url of profile.seekUrls) {
       const jobs = await fetchSeekJobs(url);
       for (const job of jobs) {
         if (job.id) seenIds.add(job.id);
@@ -373,7 +431,7 @@ async function startSeekMonitor(
     console.log(`   Marked ${seenIds.size} existing jobs as seen.\n`);
   }
 
-  await checkOnce(urls, seenFile, config, seenIds);
+  await checkOnce(profile.seekUrls, seenFile, smtp, profile.emailTo, seenIds);
 
   setInterval(async () => {
     if (isChecking) return;
@@ -382,25 +440,32 @@ async function startSeekMonitor(
       const now = new Date().toLocaleTimeString("en-AU", {
         timeZone: "Australia/Perth",
       });
-      console.log(`\n⏰ [${now}] [SEEK] Running scheduled check...`);
-      await checkOnce(urls, seenFile, config, seenIds);
+      console.log(
+        `\n⏰ [${now}] [SEEK:${profile.name}] Running scheduled check...`,
+      );
+      await checkOnce(
+        profile.seekUrls,
+        seenFile,
+        smtp,
+        profile.emailTo,
+        seenIds,
+      );
     } finally {
       isChecking = false;
     }
-  }, checkIntervalMs);
+  }, profile.seekCheckIntervalMs);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const config = loadConfig();
+  const { smtp, profiles } = loadConfig();
 
-  await startSeekMonitor(
-    config.seekUrls,
-    SEEK_SEEN_FILE,
-    config.seekCheckIntervalMs,
-    config,
-  );
+  for (const profile of profiles) {
+    startSeekMonitor(profile, smtp).catch((err) =>
+      console.error(`❌ [SEEK:${profile.name}] monitor crashed:`, err),
+    );
+  }
 }
 
 main().catch(console.error);
