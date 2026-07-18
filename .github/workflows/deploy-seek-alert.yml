@@ -18,7 +18,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd ~/apps/playground
-            git pull origin main
+            git pull origin master
             cd seek-alert
             npm install
             pm2 restart seek-alert
