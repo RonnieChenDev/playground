@@ -4,8 +4,6 @@ import * as nodemailer from "nodemailer";
 import "dotenv/config";
 import puppeteer from "puppeteer-core";
 
-let isChecking = false;
-
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface Job {
@@ -17,38 +15,38 @@ interface Job {
   listedAt: string;
 }
 
-interface Config {
+interface SmtpConfig {
   emailUser: string;
   emailAppPassword: string;
+}
+
+interface AiFilterConfig {
+  enabled: boolean;
+  model?: string;
+  unwantedCriteria: string[];
+}
+
+interface Profile {
+  name: string;
   emailTo: string;
   seekUrls: string[];
-  indeedUrls: string[];
   seekCheckIntervalMs: number;
-  indeedCheckIntervalMs: number;
+  aiFilter?: AiFilterConfig;
 }
+
+interface AppConfig {
+  smtp: SmtpConfig;
+  anthropicApiKey?: string;
+  profiles: Profile[];
+}
+
+const DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-function loadConfig(): Config {
+function loadConfig(): AppConfig {
   const emailUser = process.env.EMAIL_USER ?? "";
   const emailAppPassword = process.env.EMAIL_APP_PASSWORD ?? "";
-  const emailTo = process.env.EMAIL_TO ?? "";
-  const seekUrls = (process.env.SEEK_URLS ?? "")
-    .split(",")
-    .map((u) => u.trim())
-    .filter(Boolean);
-  const indeedUrls = (process.env.INDEED_URLS ?? "")
-    .split(",")
-    .map((u) => u.trim())
-    .filter(Boolean);
-  const seekInterval = parseInt(
-    process.env.SEEK_CHECK_INTERVAL_MINUTES ?? "30",
-    10,
-  );
-  const indeedInterval = parseInt(
-    process.env.INDEED_CHECK_INTERVAL_MINUTES ?? "30",
-    10,
-  );
 
   if (!emailUser || emailUser === "yourname@gmail.com") {
     console.error("❌ Set EMAIL_USER in .env");
@@ -58,26 +56,82 @@ function loadConfig(): Config {
     console.error("❌ Set EMAIL_APP_PASSWORD in .env");
     process.exit(1);
   }
-  if (seekUrls.length === 0 && indeedUrls.length === 0) {
-    console.error("❌ Set at least one SEEK_URLS or INDEED_URLS in .env");
+
+  const configPath = path.resolve(
+    __dirname,
+    "..",
+    process.env.CONFIG_PATH ?? "config.json",
+  );
+
+  let raw: any;
+  try {
+    raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch (err) {
+    console.error(`❌ Failed to read config file at ${configPath}:`, err);
     process.exit(1);
   }
 
-  return {
-    emailUser,
-    emailAppPassword,
-    emailTo: emailTo || emailUser,
-    seekUrls,
-    indeedUrls,
-    seekCheckIntervalMs: seekInterval * 60 * 1000,
-    indeedCheckIntervalMs: indeedInterval * 60 * 1000,
-  };
+  const profiles: Profile[] = (raw.profiles ?? [])
+    .map((p: any) => ({
+      name: String(p.name ?? "").trim(),
+      emailTo: String(p.emailTo ?? "").trim(),
+      seekUrls: (p.seekUrls ?? [])
+        .map((u: string) => u.trim())
+        .filter(Boolean),
+      seekCheckIntervalMs: (p.seekCheckIntervalMinutes ?? 30) * 60 * 1000,
+      aiFilter: p.aiFilter
+        ? {
+            enabled: Boolean(p.aiFilter.enabled),
+            model: p.aiFilter.model,
+            unwantedCriteria: p.aiFilter.unwantedCriteria ?? [],
+          }
+        : undefined,
+    }))
+    .filter((p: Profile) => {
+      if (!p.name || !p.emailTo) {
+        console.error(
+          "❌ Each profile needs 'name' and 'emailTo'; skipping invalid entry.",
+        );
+        return false;
+      }
+      if (p.seekUrls.length === 0) {
+        console.log(`⚠️  Profile "${p.name}" has no seekUrls, skipping.`);
+        return false;
+      }
+      return true;
+    });
+
+  if (profiles.length === 0) {
+    console.error("❌ No valid profile with seekUrls found in config.json");
+    process.exit(1);
+  }
+
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  const needsAi = profiles.some((p) => p.aiFilter?.enabled);
+  if (needsAi && !anthropicApiKey) {
+    console.warn(
+      "⚠️  Some profiles have aiFilter.enabled=true but ANTHROPIC_API_KEY is missing in .env — AI filtering will be skipped for them.",
+    );
+  }
+
+  return { smtp: { emailUser, emailAppPassword }, anthropicApiKey, profiles };
 }
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const SEEK_SEEN_FILE = path.join(__dirname, "seen-jobs-seek.json");
-const INDEED_SEEN_FILE = path.join(__dirname, "seen-jobs-indeed.json");
+const DATA_DIR = path.join(__dirname, "data");
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function sanitizeFileName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function seenFileFor(profileName: string): string {
+  return path.join(
+    DATA_DIR,
+    `seen-jobs-seek-${sanitizeFileName(profileName)}.json`,
+  );
+}
 
 function loadSeenIds(file: string): Set<string> {
   try {
@@ -90,6 +144,30 @@ function loadSeenIds(file: string): Set<string> {
 
 function saveSeenIds(ids: Set<string>, file: string): void {
   fs.writeFileSync(file, JSON.stringify([...ids], null, 2));
+}
+
+interface RejectedJob extends Job {
+  reason: string;
+  rejectedAt: string;
+}
+
+function rejectedFileFor(profileName: string): string {
+  return path.join(
+    DATA_DIR,
+    `rejected-jobs-seek-${sanitizeFileName(profileName)}.json`,
+  );
+}
+
+function loadRejectedJobs(file: string): RejectedJob[] {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch {
+    return [];
+  }
+}
+
+function saveRejectedJobs(jobs: RejectedJob[], file: string): void {
+  fs.writeFileSync(file, JSON.stringify(jobs, null, 2));
 }
 
 // ─── Browser ─────────────────────────────────────────────────────────────────
@@ -175,7 +253,7 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
           title: item.title ?? item.jobTitle ?? "",
           company: item.advertiser?.description ?? item.companyName ?? "",
           location: item.location ?? item.suburb ?? "",
-          url: `https://www.seek.com.au/job/${id}`,
+          url: `https://au.seek.com/job/${id}`,
           listedAt: item.listedAt ?? item.listingDate ?? "",
         });
       }
@@ -229,7 +307,7 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
               location: location || "Perth WA",
               url: href.startsWith("http")
                 ? href
-                : `https://www.seek.com.au${href}`,
+                : `https://au.seek.com${href}`,
               listedAt: listedAt || "Recently",
             });
           }
@@ -249,106 +327,112 @@ async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
   return jobs;
 }
 
-// ─── Indeed Fetcher ───────────────────────────────────────────────────────────
+async function fetchJobDescriptionsForNewJobs(
+  jobs: Job[],
+): Promise<Map<string, string>> {
+  const descriptions = new Map<string, string>();
+  if (jobs.length === 0) return descriptions;
 
-async function fetchIndeedJobs(indeedUrl: string): Promise<Job[]> {
-  const jobs: Job[] = [];
   let browser;
   try {
     browser = await createBrowser();
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    );
-    await page.goto(indeedUrl, { waitUntil: "networkidle2", timeout: 30000 });
-
-    const pageTitle = await page.title();
-    console.log(`   [Indeed] Page title: ${pageTitle}`);
-
-    // Strategy 1: window mosaic data
-    const mosaicData = await page.evaluate(() => {
-      const w = window as any;
-      const provider = w["mosaic-provider-jobcards"];
-      return provider?.model?.results ?? null;
-    });
-
-    if (Array.isArray(mosaicData)) {
-      for (const item of mosaicData) {
-        const id = item.jobkey ?? "";
-        if (!id) continue;
-        jobs.push({
-          id,
-          title: item.displayTitle ?? item.title ?? "",
-          company: item.company ?? "",
-          location: item.formattedLocation ?? item.location ?? "",
-          url: `https://au.indeed.com/viewjob?jk=${id}`,
-          listedAt: item.pubDate ?? item.formattedRelativeTime ?? "",
+    for (const job of jobs) {
+      const page = await browser.newPage();
+      try {
+        await page.setUserAgent(
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        );
+        await page.goto(job.url, {
+          waitUntil: "networkidle2",
+          timeout: 30000,
         });
+        const description = await page.evaluate(() => {
+          const el =
+            document.querySelector('[data-automation="jobAdDetails"]') ??
+            document.querySelector('[data-testid="jobAdDetails"]') ??
+            document.querySelector("article");
+          return el?.textContent?.trim() ?? "";
+        });
+        descriptions.set(job.id, description);
+      } catch (err) {
+        console.error(`❌ Failed to fetch description for ${job.url}:`, err);
+        descriptions.set(job.id, "");
+      } finally {
+        await page.close();
       }
+      await new Promise((r) => setTimeout(r, 1500));
     }
-
-    // Strategy 2: DOM fallback
-    if (jobs.length === 0) {
-      const domJobs = await page.evaluate(() => {
-        const results: Array<{
-          id: string;
-          title: string;
-          company: string;
-          location: string;
-          url: string;
-          listedAt: string;
-        }> = [];
-        const cards = document.querySelectorAll("[data-jk]");
-        cards.forEach((card) => {
-          const el = card as HTMLElement;
-          const id = el.getAttribute("data-jk") ?? "";
-          if (!id) return;
-          const title =
-            el
-              .querySelector('[data-testid="job-title"] span, h2 a span')
-              ?.textContent?.trim() ?? "";
-          const company =
-            el
-              .querySelector('[data-testid="company-name"]')
-              ?.textContent?.trim() ?? "";
-          const location =
-            el
-              .querySelector('[data-testid="text-location"]')
-              ?.textContent?.trim() ?? "";
-          const listedAt =
-            el
-              .querySelector('[data-testid="myJobsStateDate"]')
-              ?.textContent?.trim() ?? "";
-          results.push({
-            id,
-            title: title || "Unknown Title",
-            company: company || "Unknown Company",
-            location: location || "",
-            url: `https://au.indeed.com/viewjob?jk=${id}`,
-            listedAt: listedAt || "Recently",
-          });
-        });
-        return results;
-      });
-      jobs.push(...domJobs);
-    }
-
-    await page.close();
-    await browser.close();
-  } catch (err) {
-    console.error(`❌ [Indeed] Failed to fetch ${indeedUrl}:`, err);
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
-  return jobs;
+  return descriptions;
+}
+
+// ─── AI Filter ────────────────────────────────────────────────────────────────
+
+interface ClassifyResult {
+  reject: boolean;
+  reason: string;
+}
+
+async function classifyJobWithClaude(
+  apiKey: string,
+  model: string,
+  unwantedCriteria: string[],
+  job: Job,
+  description: string,
+): Promise<ClassifyResult> {
+  const systemPrompt = `你是一个求职助手，帮用户筛掉不想看到的职位。
+用户不想要满足以下任一条件的职位（命中任意一条就应该 reject: true）：
+${unwantedCriteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}
+
+只输出严格 JSON，不要有任何多余文字、不要用 markdown 代码块包裹：
+{"reject": boolean, "reason": string}`;
+
+  const userContent = `职位标题：${job.title}
+公司：${job.company}
+地点：${job.location}
+职位描述：
+${description || "(未能获取详情描述，仅凭标题/公司判断)"}`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 200,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userContent }],
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Claude API error ${res.status}: ${errText}`);
+  }
+
+  const data: any = await res.json();
+  const text = data?.content?.[0]?.text ?? "";
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error(`Unexpected Claude response: ${text}`);
+
+  const parsed = JSON.parse(jsonMatch[0]);
+  return {
+    reject: Boolean(parsed.reject),
+    reason: String(parsed.reason ?? ""),
+  };
 }
 
 // ─── Email Notifier ───────────────────────────────────────────────────────────
 
-function createTransporter(config: Config) {
+function createTransporter(smtp: SmtpConfig) {
   return nodemailer.createTransport({
     service: "gmail",
-    auth: { user: config.emailUser, pass: config.emailAppPassword },
+    auth: { user: smtp.emailUser, pass: smtp.emailAppPassword },
   });
 }
 
@@ -360,13 +444,12 @@ function escapeHtml(text: string): string {
 }
 
 async function sendJobEmail(
-  config: Config,
+  smtp: SmtpConfig,
+  emailTo: string,
   jobs: Job[],
   searchLabel: string,
-  platform: "seek" | "indeed",
 ): Promise<void> {
-  const transporter = createTransporter(config);
-  const platformLabel = platform === "seek" ? "SEEK" : "Indeed";
+  const transporter = createTransporter(smtp);
 
   const jobRows = jobs
     .map(
@@ -396,65 +479,106 @@ async function sendJobEmail(
       </thead>
       <tbody>${jobRows}</tbody>
     </table>
-    <p style="color:#999;font-size:12px;margin-top:16px">Sent by ${platformLabel} Job Alert</p>
+    <p style="color:#999;font-size:12px;margin-top:16px">Sent by SEEK Job Alert</p>
   `;
 
   try {
     await transporter.sendMail({
-      from: config.emailUser,
-      to: config.emailTo,
-      subject: `🔔 ${platformLabel}: ${jobs.length} new ${jobs.length === 1 ? "job" : "jobs"} — ${searchLabel}`,
+      from: smtp.emailUser,
+      to: emailTo,
+      subject: `🔔 SEEK: ${jobs.length} new ${jobs.length === 1 ? "job" : "jobs"} — ${searchLabel}`,
       html,
     });
   } catch (err) {
-    console.error(`❌ [${platformLabel}] Failed to send email:`, err);
+    console.error("❌ Failed to send email:", err);
   }
 }
 
 // ─── Check Loop ───────────────────────────────────────────────────────────────
 
 async function checkOnce(
-  platform: "seek" | "indeed",
   urls: string[],
   seenFile: string,
-  config: Config,
+  rejectedFile: string,
+  smtp: SmtpConfig,
+  emailTo: string,
   seenIds: Set<string>,
+  rejectedIds: Set<string>,
+  rejectedJobs: RejectedJob[],
+  aiFilter: AiFilterConfig | undefined,
+  anthropicApiKey: string | undefined,
 ): Promise<void> {
   for (const url of urls) {
-    const label =
-      platform === "seek"
-        ? decodeURIComponent(
-            url.replace("https://www.seek.com.au/", "").replace(/\//g, " › "),
-          )
-        : (() => {
-            try {
-              return decodeURIComponent(
-                new URL(url).searchParams.get("q") ?? url,
-              );
-            } catch {
-              return url;
-            }
-          })();
+    const label = decodeURIComponent(
+      url.replace("https://au.seek.com/", "").replace(/\//g, " › "),
+    );
 
-    console.log(`🔍 [${platform.toUpperCase()}] Checking: ${label}`);
+    console.log(`🔍 [SEEK] Checking: ${label}`);
 
-    const jobs =
-      platform === "seek"
-        ? await fetchSeekJobs(url)
-        : await fetchIndeedJobs(url);
-
+    const jobs = await fetchSeekJobs(url);
     console.log(`   Found ${jobs.length} jobs`);
 
-    const newJobs: Job[] = [];
-    for (const job of jobs) {
-      if (!job.id || seenIds.has(job.id)) continue;
-      seenIds.add(job.id);
-      newJobs.push(job);
+    // 去重要同时排除"已推送"和"已被 AI 拒绝"两个列表
+    const newJobs = jobs.filter(
+      (job) => job.id && !seenIds.has(job.id) && !rejectedIds.has(job.id),
+    );
+
+    let jobsToSend: Job[] = newJobs;
+    let rejectedThisRun = 0;
+
+    if (aiFilter?.enabled && newJobs.length > 0) {
+      if (!anthropicApiKey) {
+        console.error(
+          "⚠️  aiFilter.enabled=true but ANTHROPIC_API_KEY missing; sending without AI filtering.",
+        );
+      } else {
+        jobsToSend = [];
+        const descriptions = await fetchJobDescriptionsForNewJobs(newJobs);
+        for (const job of newJobs) {
+          try {
+            const result = await classifyJobWithClaude(
+              anthropicApiKey,
+              aiFilter.model ?? DEFAULT_CLAUDE_MODEL,
+              aiFilter.unwantedCriteria,
+              job,
+              descriptions.get(job.id) ?? "",
+            );
+            if (result.reject) {
+              console.log(`🚫 [AI] Rejected "${job.title}": ${result.reason}`);
+              rejectedJobs.push({
+                ...job,
+                reason: result.reason,
+                rejectedAt: new Date().toISOString(),
+              });
+              rejectedIds.add(job.id);
+              rejectedThisRun++;
+            } else {
+              jobsToSend.push(job);
+            }
+          } catch (err) {
+            console.error(
+              `❌ [AI] Classify failed for "${job.title}", sending without filtering:`,
+              err,
+            );
+            jobsToSend.push(job);
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        if (rejectedThisRun > 0) saveRejectedJobs(rejectedJobs, rejectedFile);
+      }
     }
 
-    if (newJobs.length > 0) {
-      await sendJobEmail(config, newJobs, label, platform);
-      console.log(`🎉 Emailed ${newJobs.length} new job(s)!`);
+    for (const job of jobsToSend) seenIds.add(job.id);
+
+    if (jobsToSend.length > 0) {
+      await sendJobEmail(smtp, emailTo, jobsToSend, label);
+      console.log(
+        `🎉 Emailed ${jobsToSend.length} new job(s)! (${rejectedThisRun} filtered out by AI)`,
+      );
+    } else if (newJobs.length > 0) {
+      console.log(
+        `✅ ${newJobs.length} new job(s) found, all filtered out by AI.`,
+      );
     } else {
       console.log("✅ No new jobs for this search.");
     }
@@ -465,34 +589,40 @@ async function checkOnce(
   saveSeenIds(seenIds, seenFile);
 }
 
-// ─── Platform Runner ──────────────────────────────────────────────────────────
+// ─── Profile Runner ───────────────────────────────────────────────────────────
 
-async function startPlatform(
-  platform: "seek" | "indeed",
-  urls: string[],
-  seenFile: string,
-  checkIntervalMs: number,
-  config: Config,
+async function startSeekMonitor(
+  profile: Profile,
+  smtp: SmtpConfig,
+  anthropicApiKey: string | undefined,
 ): Promise<void> {
-  const platformLabel = platform === "seek" ? "SEEK" : "Indeed";
+  const seenFile = seenFileFor(profile.name);
+  const rejectedFile = rejectedFileFor(profile.name);
   const seenIds = loadSeenIds(seenFile);
+  const rejectedJobs = loadRejectedJobs(rejectedFile);
+  const rejectedIds = new Set(rejectedJobs.map((j) => j.id));
+  let isChecking = false;
 
-  console.log(`🚀 ${platformLabel} Job Alert started`);
+  console.log(`🚀 SEEK Job Alert started for "${profile.name}"`);
   console.log(
-    `   Monitoring ${urls.length} search(es), every ${checkIntervalMs / 60000} minutes`,
+    `   Monitoring ${profile.seekUrls.length} search(es), every ${profile.seekCheckIntervalMs / 60000} minutes`,
   );
-  console.log(`   Alerts → ${config.emailTo}`);
-  console.log(`   ${seenIds.size} previously seen jobs loaded\n`);
-
-  if (seenIds.size === 0) {
+  console.log(`   Alerts → ${profile.emailTo}`);
+  if (profile.aiFilter?.enabled) {
     console.log(
-      `📝 [${platformLabel}] First run — marking existing jobs as seen (no emails sent)`,
+      `   🤖 AI filter enabled (model: ${profile.aiFilter.model ?? DEFAULT_CLAUDE_MODEL})`,
     );
-    for (const url of urls) {
-      const jobs =
-        platform === "seek"
-          ? await fetchSeekJobs(url)
-          : await fetchIndeedJobs(url);
+  }
+  console.log(
+    `   ${seenIds.size} previously seen, ${rejectedIds.size} previously rejected\n`,
+  );
+
+  if (seenIds.size === 0 && rejectedIds.size === 0) {
+    console.log(
+      `📝 [SEEK:${profile.name}] First run — marking existing jobs as seen (no emails sent)`,
+    );
+    for (const url of profile.seekUrls) {
+      const jobs = await fetchSeekJobs(url);
       for (const job of jobs) {
         if (job.id) seenIds.add(job.id);
       }
@@ -502,7 +632,18 @@ async function startPlatform(
     console.log(`   Marked ${seenIds.size} existing jobs as seen.\n`);
   }
 
-  await checkOnce(platform, urls, seenFile, config, seenIds);
+  await checkOnce(
+    profile.seekUrls,
+    seenFile,
+    rejectedFile,
+    smtp,
+    profile.emailTo,
+    seenIds,
+    rejectedIds,
+    rejectedJobs,
+    profile.aiFilter,
+    anthropicApiKey,
+  );
 
   setInterval(async () => {
     if (isChecking) return;
@@ -512,42 +653,35 @@ async function startPlatform(
         timeZone: "Australia/Perth",
       });
       console.log(
-        `\n⏰ [${now}] [${platformLabel}] Running scheduled check...`,
+        `\n⏰ [${now}] [SEEK:${profile.name}] Running scheduled check...`,
       );
-      await checkOnce(platform, urls, seenFile, config, seenIds);
+      await checkOnce(
+        profile.seekUrls,
+        seenFile,
+        rejectedFile,
+        smtp,
+        profile.emailTo,
+        seenIds,
+        rejectedIds,
+        rejectedJobs,
+        profile.aiFilter,
+        anthropicApiKey,
+      );
     } finally {
       isChecking = false;
     }
-  }, checkIntervalMs);
+  }, profile.seekCheckIntervalMs);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const config = loadConfig();
+  const { smtp, anthropicApiKey, profiles } = loadConfig();
 
-  if (config.seekUrls.length > 0) {
-    startPlatform(
-      "seek",
-      config.seekUrls,
-      SEEK_SEEN_FILE,
-      config.seekCheckIntervalMs,
-      config,
+  for (const profile of profiles) {
+    startSeekMonitor(profile, smtp, anthropicApiKey).catch((err) =>
+      console.error(`❌ [SEEK:${profile.name}] monitor crashed:`, err),
     );
-  } else {
-    console.log("⚠️  No SEEK_URLS set, skipping SEEK.");
-  }
-
-  if (config.indeedUrls.length > 0) {
-    startPlatform(
-      "indeed",
-      config.indeedUrls,
-      INDEED_SEEN_FILE,
-      config.indeedCheckIntervalMs,
-      config,
-    );
-  } else {
-    console.log("⚠️  No INDEED_URLS set, skipping Indeed.");
   }
 }
 
