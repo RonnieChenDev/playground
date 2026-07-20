@@ -3,6 +3,13 @@ import * as path from "path";
 import * as nodemailer from "nodemailer";
 import "dotenv/config";
 import puppeteer from "puppeteer-core";
+import {
+  SQSClient,
+  CreateQueueCommand,
+  SendMessageBatchCommand,
+  ReceiveMessageCommand,
+  DeleteMessageBatchCommand,
+} from "@aws-sdk/client-sqs";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -26,6 +33,11 @@ interface AiFilterConfig {
   unwantedCriteria: string[];
 }
 
+interface DeliveryConfig {
+  mode: "realtime" | "digest";
+  digestTimes: string[]; // "HH:mm", Perth time. Only used when mode === "digest".
+}
+
 interface Profile {
   name: string;
   emailTo: string;
@@ -33,6 +45,7 @@ interface Profile {
   seekCheckIntervalMs: number;
   titleExcludeKeywords?: string[];
   aiFilter?: AiFilterConfig;
+  delivery: DeliveryConfig;
 }
 
 interface AppConfig {
@@ -44,6 +57,24 @@ interface AppConfig {
 const DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
+
+function parseDeliveryConfig(raw: any, profileName: string): DeliveryConfig {
+  const mode = raw?.mode === "digest" ? "digest" : "realtime";
+  const digestTimes: string[] = Array.isArray(raw?.digestTimes)
+    ? raw.digestTimes
+        .map((t: unknown) => String(t).trim())
+        .filter((t: string) => /^\d{2}:\d{2}$/.test(t))
+    : [];
+
+  if (mode === "digest" && digestTimes.length === 0) {
+    console.log(
+      `⚠️  Profile "${profileName}" has delivery.mode="digest" but no valid digestTimes (expected "HH:mm"); falling back to realtime.`,
+    );
+    return { mode: "realtime", digestTimes: [] };
+  }
+
+  return { mode, digestTimes };
+}
 
 function loadConfig(): AppConfig {
   const emailUser = process.env.EMAIL_USER ?? "";
@@ -90,6 +121,7 @@ function loadConfig(): AppConfig {
             unwantedCriteria: p.aiFilter.unwantedCriteria ?? [],
           }
         : undefined,
+      delivery: parseDeliveryConfig(p.delivery, String(p.name ?? "")),
     }))
     .filter((p: Profile) => {
       if (!p.name || !p.emailTo) {
@@ -173,6 +205,127 @@ function loadRejectedJobs(file: string): RejectedJob[] {
 
 function saveRejectedJobs(jobs: RejectedJob[], file: string): void {
   fs.writeFileSync(file, JSON.stringify(jobs, null, 2));
+}
+
+interface PendingJob extends Job {
+  label: string;
+  foundAt: string;
+}
+
+interface DigestState {
+  date: string; // "YYYY-MM-DD", Perth time
+  firedTimes: string[]; // "HH:mm" entries already sent today
+}
+
+function digestStateFileFor(profileName: string): string {
+  return path.join(
+    DATA_DIR,
+    `digest-state-seek-${sanitizeFileName(profileName)}.json`,
+  );
+}
+
+function loadDigestState(file: string): DigestState {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    if (data && typeof data.date === "string" && Array.isArray(data.firedTimes)) {
+      return data;
+    }
+  } catch {
+    // ignore, fall through to default
+  }
+  return { date: "", firedTimes: [] };
+}
+
+function saveDigestState(state: DigestState, file: string): void {
+  fs.writeFileSync(file, JSON.stringify(state, null, 2));
+}
+
+// ─── SQS Digest Queue ────────────────────────────────────────────────────────
+// 汇总（digest）模式下"待发职位"用 AWS SQS 存储，而不是本地文件：
+// - enqueuePendingJobs：新筛出的合格职位塞进队列
+// - drainPendingJobs：到了汇总发送时间点时，把队列里攒的全部职位取出并删除
+
+const AWS_REGION = process.env.AWS_REGION ?? "ap-southeast-2";
+const sqsClient = new SQSClient({ region: AWS_REGION });
+
+async function getOrCreateDigestQueueUrl(profileName: string): Promise<string> {
+  const queueName = `seek-alert-digest-${sanitizeFileName(profileName)}`;
+  const res = await sqsClient.send(
+    new CreateQueueCommand({
+      QueueName: queueName,
+      Attributes: {
+        MessageRetentionPeriod: String(14 * 24 * 60 * 60), // 14 天
+      },
+    }),
+  );
+  if (!res.QueueUrl) {
+    throw new Error(`Failed to resolve SQS queue URL for "${queueName}"`);
+  }
+  return res.QueueUrl;
+}
+
+async function enqueuePendingJobs(
+  queueUrl: string,
+  jobs: PendingJob[],
+): Promise<void> {
+  for (let i = 0; i < jobs.length; i += 10) {
+    const batch = jobs.slice(i, i + 10);
+    await sqsClient.send(
+      new SendMessageBatchCommand({
+        QueueUrl: queueUrl,
+        Entries: batch.map((job, idx) => ({
+          Id: `${i + idx}`,
+          MessageBody: JSON.stringify(job),
+        })),
+      }),
+    );
+  }
+}
+
+async function drainPendingJobs(queueUrl: string): Promise<PendingJob[]> {
+  const jobs: PendingJob[] = [];
+  for (let iterations = 0; iterations < 50; iterations++) {
+    const res = await sqsClient.send(
+      new ReceiveMessageCommand({
+        QueueUrl: queueUrl,
+        MaxNumberOfMessages: 10,
+        WaitTimeSeconds: 0,
+      }),
+    );
+    const messages = res.Messages ?? [];
+    if (messages.length === 0) break;
+
+    for (const msg of messages) {
+      try {
+        jobs.push(JSON.parse(msg.Body ?? "{}"));
+      } catch (err) {
+        console.error("❌ [Digest] Failed to parse SQS message body:", err);
+      }
+    }
+
+    await sqsClient.send(
+      new DeleteMessageBatchCommand({
+        QueueUrl: queueUrl,
+        Entries: messages.map((msg, idx) => ({
+          Id: `${idx}`,
+          ReceiptHandle: msg.ReceiptHandle!,
+        })),
+      }),
+    );
+  }
+  return jobs;
+}
+
+function perthNowParts(): { date: string; time: string } {
+  const now = new Date();
+  const date = now.toLocaleDateString("en-CA", { timeZone: "Australia/Perth" });
+  const time = now.toLocaleTimeString("en-AU", {
+    timeZone: "Australia/Perth",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return { date, time };
 }
 
 // ─── Browser ─────────────────────────────────────────────────────────────────
@@ -434,6 +587,11 @@ ${description || "(未能获取详情描述，仅凭标题/公司判断)"}`;
 
 // ─── Email Notifier ───────────────────────────────────────────────────────────
 
+interface EmailGroup {
+  label: string;
+  jobs: Job[];
+}
+
 function createTransporter(smtp: SmtpConfig) {
   return nodemailer.createTransport({
     service: "gmail",
@@ -448,14 +606,7 @@ function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
-async function sendJobEmail(
-  smtp: SmtpConfig,
-  emailTo: string,
-  jobs: Job[],
-  searchLabel: string,
-): Promise<void> {
-  const transporter = createTransporter(smtp);
-
+function renderJobTable(jobs: Job[]): string {
   const jobRows = jobs
     .map(
       (job) =>
@@ -470,9 +621,7 @@ async function sendJobEmail(
     )
     .join("\n");
 
-  const html = `
-    <h2 style="color:#333">🆕 ${jobs.length} new job(s) found</h2>
-    <p style="color:#666">Search: ${escapeHtml(searchLabel)}</p>
+  return `
     <table style="border-collapse:collapse;width:100%;font-family:sans-serif;font-size:14px">
       <thead>
         <tr style="background:#f8f9fa">
@@ -483,7 +632,31 @@ async function sendJobEmail(
         </tr>
       </thead>
       <tbody>${jobRows}</tbody>
-    </table>
+    </table>`;
+}
+
+async function sendJobEmail(
+  smtp: SmtpConfig,
+  emailTo: string,
+  groups: EmailGroup[],
+): Promise<void> {
+  const nonEmptyGroups = groups.filter((g) => g.jobs.length > 0);
+  const totalCount = nonEmptyGroups.reduce((sum, g) => sum + g.jobs.length, 0);
+  if (totalCount === 0) return;
+
+  const transporter = createTransporter(smtp);
+
+  const sections = nonEmptyGroups
+    .map(
+      (group) => `
+    <h3 style="color:#333;margin-top:24px">${escapeHtml(group.label)} (${group.jobs.length})</h3>
+    ${renderJobTable(group.jobs)}`,
+    )
+    .join("\n");
+
+  const html = `
+    <h2 style="color:#333">🆕 ${totalCount} new job(s) found</h2>
+    ${sections}
     <p style="color:#999;font-size:12px;margin-top:16px">Sent by SEEK Job Alert</p>
   `;
 
@@ -491,7 +664,7 @@ async function sendJobEmail(
     await transporter.sendMail({
       from: smtp.emailUser,
       to: emailTo,
-      subject: `🔔 SEEK: ${jobs.length} new ${jobs.length === 1 ? "job" : "jobs"} — ${searchLabel}`,
+      subject: `🔔 SEEK: ${totalCount} new ${totalCount === 1 ? "job" : "jobs"}`,
       html,
     });
   } catch (err) {
@@ -505,15 +678,15 @@ async function checkOnce(
   urls: string[],
   seenFile: string,
   rejectedFile: string,
-  smtp: SmtpConfig,
-  emailTo: string,
   seenIds: Set<string>,
   rejectedIds: Set<string>,
   rejectedJobs: RejectedJob[],
   titleExcludeKeywords: string[] | undefined,
   aiFilter: AiFilterConfig | undefined,
   anthropicApiKey: string | undefined,
-): Promise<void> {
+): Promise<EmailGroup[]> {
+  const groups: EmailGroup[] = [];
+
   for (const url of urls) {
     const label = decodeURIComponent(
       url.replace("https://au.seek.com/", "").replace(/\//g, " › "),
@@ -524,7 +697,7 @@ async function checkOnce(
     const jobs = await fetchSeekJobs(url);
     console.log(`   Found ${jobs.length} jobs`);
 
-    // 去重要同时排除"已推送"和"已被过滤（关键词/AI）"两个列表
+    // 去重要同时排除“已推送”和“已被过滤（关键词/AI）”两个列表
     const newJobs = jobs.filter(
       (job) => job.id && !seenIds.has(job.id) && !rejectedIds.has(job.id),
     );
@@ -614,9 +787,9 @@ async function checkOnce(
     for (const job of jobsToSend) seenIds.add(job.id);
 
     if (jobsToSend.length > 0) {
-      await sendJobEmail(smtp, emailTo, jobsToSend, label);
+      groups.push({ label, jobs: jobsToSend });
       console.log(
-        `🎉 Emailed ${jobsToSend.length} new job(s)! (${keywordRejectedThisRun} by keyword, ${aiRejectedThisRun} by AI)`,
+        `✅ ${jobsToSend.length} job(s) queued to send (${keywordRejectedThisRun} by keyword, ${aiRejectedThisRun} by AI filtered out).`,
       );
     } else if (newJobs.length > 0) {
       console.log(
@@ -630,6 +803,93 @@ async function checkOnce(
   }
 
   saveSeenIds(seenIds, seenFile);
+  return groups;
+}
+
+// ─── Delivery Dispatcher ──────────────────────────────────────────────────────
+
+async function dispatchResults(
+  profile: Profile,
+  smtp: SmtpConfig,
+  groups: EmailGroup[],
+  digestQueueUrl: string | undefined,
+  digestStateFile: string,
+): Promise<void> {
+  const nonEmptyGroups = groups.filter((g) => g.jobs.length > 0);
+
+  if (profile.delivery.mode !== "digest" || !digestQueueUrl) {
+    // 实时模式（或汇总队列不可用时的兜底）：这一轮所有搜索链接的结果合并成一封邮件立刻发出
+    if (nonEmptyGroups.length > 0) {
+      await sendJobEmail(smtp, profile.emailTo, nonEmptyGroups);
+      const total = nonEmptyGroups.reduce((sum, g) => sum + g.jobs.length, 0);
+      console.log(
+        `🎉 Emailed ${total} new job(s) across ${nonEmptyGroups.length} search(es).`,
+      );
+    }
+    return;
+  }
+
+  // 汇总模式：先把这一轮筛出来的职位塞进 SQS 队列
+  if (nonEmptyGroups.length > 0) {
+    const foundAt = new Date().toISOString();
+    const newPending: PendingJob[] = [];
+    for (const group of nonEmptyGroups) {
+      for (const job of group.jobs) {
+        newPending.push({ ...job, label: group.label, foundAt });
+      }
+    }
+    try {
+      await enqueuePendingJobs(digestQueueUrl, newPending);
+      console.log(
+        `📥 [Digest] Queued ${newPending.length} job(s) into SQS for next digest send.`,
+      );
+    } catch (err) {
+      console.error("❌ [Digest] Failed to enqueue jobs into SQS:", err);
+    }
+  }
+
+  // 再检查现在是否已经到了配置的汇总发送时间点
+  const { date, time } = perthNowParts();
+  let state = loadDigestState(digestStateFile);
+  if (state.date !== date) {
+    state = { date, firedTimes: [] };
+  }
+
+  const dueTimes = profile.delivery.digestTimes.filter(
+    (t) => time >= t && !state.firedTimes.includes(t),
+  );
+
+  if (dueTimes.length > 0) {
+    try {
+      const pending = await drainPendingJobs(digestQueueUrl);
+      if (pending.length > 0) {
+        const grouped = new Map<string, Job[]>();
+        for (const job of pending) {
+          const list = grouped.get(job.label) ?? [];
+          list.push(job);
+          grouped.set(job.label, list);
+        }
+        const digestGroups: EmailGroup[] = [...grouped.entries()].map(
+          ([label, jobs]) => ({ label, jobs }),
+        );
+        await sendJobEmail(smtp, profile.emailTo, digestGroups);
+        console.log(
+          `🎉 [Digest] Sent ${pending.length} job(s) at ${dueTimes.join(", ")} (Perth time).`,
+        );
+      } else {
+        console.log(
+          `📭 [Digest] ${dueTimes.join(", ")} reached, but no jobs queued today.`,
+        );
+      }
+      state.firedTimes.push(...dueTimes);
+      saveDigestState(state, digestStateFile);
+    } catch (err) {
+      console.error(
+        "❌ [Digest] Failed to drain SQS queue and send digest email (will retry next check):",
+        err,
+      );
+    }
+  }
 }
 
 // ─── Profile Runner ───────────────────────────────────────────────────────────
@@ -641,16 +901,37 @@ async function startSeekMonitor(
 ): Promise<void> {
   const seenFile = seenFileFor(profile.name);
   const rejectedFile = rejectedFileFor(profile.name);
+  const digestStateFile = digestStateFileFor(profile.name);
   const seenIds = loadSeenIds(seenFile);
   const rejectedJobs = loadRejectedJobs(rejectedFile);
   const rejectedIds = new Set(rejectedJobs.map((j) => j.id));
   let isChecking = false;
+
+  let digestQueueUrl: string | undefined;
+  if (profile.delivery.mode === "digest") {
+    try {
+      digestQueueUrl = await getOrCreateDigestQueueUrl(profile.name);
+    } catch (err) {
+      console.error(
+        `❌ [SEEK:${profile.name}] Failed to set up SQS digest queue; falling back to realtime delivery:`,
+        err,
+      );
+      profile.delivery = { mode: "realtime", digestTimes: [] };
+    }
+  }
 
   console.log(`🚀 SEEK Job Alert started for "${profile.name}"`);
   console.log(
     `   Monitoring ${profile.seekUrls.length} search(es), every ${profile.seekCheckIntervalMs / 60000} minutes`,
   );
   console.log(`   Alerts → ${profile.emailTo}`);
+  if (profile.delivery.mode === "digest") {
+    console.log(
+      `   📬 Delivery: digest via SQS (${digestQueueUrl}), sent at ${profile.delivery.digestTimes.join(", ")} (Perth time)`,
+    );
+  } else {
+    console.log(`   📬 Delivery: realtime (merged into one email per check)`);
+  }
   if (profile.titleExcludeKeywords && profile.titleExcludeKeywords.length > 0) {
     console.log(
       `   🔤 Title keyword filter: ${profile.titleExcludeKeywords.join(", ")}`,
@@ -680,19 +961,22 @@ async function startSeekMonitor(
     console.log(`   Marked ${seenIds.size} existing jobs as seen.\n`);
   }
 
-  await checkOnce(
-    profile.seekUrls,
-    seenFile,
-    rejectedFile,
-    smtp,
-    profile.emailTo,
-    seenIds,
-    rejectedIds,
-    rejectedJobs,
-    profile.titleExcludeKeywords,
-    profile.aiFilter,
-    anthropicApiKey,
-  );
+  const runCheck = async (): Promise<void> => {
+    const groups = await checkOnce(
+      profile.seekUrls,
+      seenFile,
+      rejectedFile,
+      seenIds,
+      rejectedIds,
+      rejectedJobs,
+      profile.titleExcludeKeywords,
+      profile.aiFilter,
+      anthropicApiKey,
+    );
+    await dispatchResults(profile, smtp, groups, digestQueueUrl, digestStateFile);
+  };
+
+  await runCheck();
 
   setInterval(async () => {
     if (isChecking) return;
@@ -704,19 +988,7 @@ async function startSeekMonitor(
       console.log(
         `\n⏰ [${now}] [SEEK:${profile.name}] Running scheduled check...`,
       );
-      await checkOnce(
-        profile.seekUrls,
-        seenFile,
-        rejectedFile,
-        smtp,
-        profile.emailTo,
-        seenIds,
-        rejectedIds,
-        rejectedJobs,
-        profile.titleExcludeKeywords,
-        profile.aiFilter,
-        anthropicApiKey,
-      );
+      await runCheck();
     } finally {
       isChecking = false;
     }

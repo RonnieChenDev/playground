@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1090.0",
     "@types/cheerio": "^0.22.35",
     "@types/node": "^25.5.0",
     "@types/node-fetch": "^2.6.13",

@@ -30,3 +30,13 @@ pm2 startup
 ```
 Then execute `pm2 startup`. It will return a command. Copy and paste it and hit enter to run.
 To check the status: `pm2 status`
+
+7. AWS SQS permissions (only needed for profiles using `delivery.mode: "digest"`)
+
+The digest delivery queue uses Amazon SQS. Either attach an IAM role to the EC2 instance, or set `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` in `.env`. The credentials/role need at least these permissions on `arn:aws:sqs:<region>:<account-id>:seek-alert-digest-*`:
+
+- `sqs:CreateQueue`
+- `sqs:SendMessage`
+- `sqs:ReceiveMessage`
+- `sqs:DeleteMessage`
+- `sqs:GetQueueAttributes`
