@@ -323,7 +323,7 @@ function perthNowParts(): { date: string; time: string } {
     timeZone: "Australia/Perth",
     hour: "2-digit",
     minute: "2-digit",
-    hour12: false,
+    hourCycle: "h23", // hour12:false 在某些 Node/ICU 环境下午夜返回 "24:xx" 而非 "00:xx"，需显式指定 h23
   });
   return { date, time };
 }
