@@ -41,6 +41,7 @@ interface DeliveryConfig {
 interface Profile {
   name: string;
   emailTo: string;
+  emailSubjectPrefix?: string;
   seekUrls: string[];
   seekCheckIntervalMs: number;
   titleExcludeKeywords?: string[];
@@ -107,6 +108,9 @@ function loadConfig(): AppConfig {
     .map((p: any) => ({
       name: String(p.name ?? "").trim(),
       emailTo: String(p.emailTo ?? "").trim(),
+      emailSubjectPrefix: p.emailSubjectPrefix
+        ? String(p.emailSubjectPrefix).trim()
+        : undefined,
       seekUrls: (p.seekUrls ?? [])
         .map((u: string) => u.trim())
         .filter(Boolean),
@@ -639,6 +643,7 @@ async function sendJobEmail(
   smtp: SmtpConfig,
   emailTo: string,
   groups: EmailGroup[],
+  subjectPrefix?: string,
 ): Promise<void> {
   const nonEmptyGroups = groups.filter((g) => g.jobs.length > 0);
   const totalCount = nonEmptyGroups.reduce((sum, g) => sum + g.jobs.length, 0);
@@ -664,7 +669,7 @@ async function sendJobEmail(
     await transporter.sendMail({
       from: smtp.emailUser,
       to: emailTo,
-      subject: `🔔 SEEK: ${totalCount} new ${totalCount === 1 ? "job" : "jobs"}`,
+      subject: `${subjectPrefix ? subjectPrefix + " " : ""}🔔 SEEK: ${totalCount} new ${totalCount === 1 ? "job" : "jobs"}`,
       html,
     });
   } catch (err) {
@@ -820,7 +825,12 @@ async function dispatchResults(
   if (profile.delivery.mode !== "digest" || !digestQueueUrl) {
     // 实时模式（或汇总队列不可用时的兜底）：这一轮所有搜索链接的结果合并成一封邮件立刻发出
     if (nonEmptyGroups.length > 0) {
-      await sendJobEmail(smtp, profile.emailTo, nonEmptyGroups);
+      await sendJobEmail(
+        smtp,
+        profile.emailTo,
+        nonEmptyGroups,
+        profile.emailSubjectPrefix,
+      );
       const total = nonEmptyGroups.reduce((sum, g) => sum + g.jobs.length, 0);
       console.log(
         `🎉 Emailed ${total} new job(s) across ${nonEmptyGroups.length} search(es).`,
@@ -872,7 +882,12 @@ async function dispatchResults(
         const digestGroups: EmailGroup[] = [...grouped.entries()].map(
           ([label, jobs]) => ({ label, jobs }),
         );
-        await sendJobEmail(smtp, profile.emailTo, digestGroups);
+        await sendJobEmail(
+          smtp,
+          profile.emailTo,
+          digestGroups,
+          profile.emailSubjectPrefix,
+        );
         console.log(
           `🎉 [Digest] Sent ${pending.length} job(s) at ${dueTimes.join(", ")} (Perth time).`,
         );
