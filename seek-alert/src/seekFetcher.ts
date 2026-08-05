@@ -82,7 +82,10 @@ export async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
                 "[data-testid*='listed'], time, [data-automation='jobListingDate']",
               ) as HTMLElement
             )?.textContent?.trim() ?? "";
-          const id = jobId || href.split("/").pop() || "";
+          // href 常带 SEEK 每次搜索会话生成的追踪参数（?ref=...&sol=...），
+          // 必须只取纯数字 job id，否则同一职位每次抓到的 id 都不一样，去重会失效
+          const hrefJobId = href.match(/\/job\/(\d+)/)?.[1] ?? "";
+          const id = jobId || hrefJobId || href.split("/").pop() || "";
           if (id) {
             results.push({
               id,
