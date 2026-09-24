@@ -1,5 +1,5 @@
 import { Job } from "./types";
-import { createBrowser } from "./browser";
+import { closeBrowser, createBrowser } from "./browser";
 
 export async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
   const jobs: Job[] = [];
@@ -103,13 +103,10 @@ export async function fetchSeekJobs(seekUrl: string): Promise<Job[]> {
       });
       jobs.push(...domJobs);
     }
-
-    await page.close();
-    await browser.close();
   } catch (err) {
     console.error(`❌ [SEEK] Failed to fetch ${seekUrl}:`, err);
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    await closeBrowser(browser);
   }
   return jobs;
 }
@@ -145,12 +142,12 @@ export async function fetchJobDescriptionsForNewJobs(
         console.error(`❌ Failed to fetch description for ${job.url}:`, err);
         descriptions.set(job.id, "");
       } finally {
-        await page.close();
+        await page.close().catch(() => {});
       }
       await new Promise((r) => setTimeout(r, 1500));
     }
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    await closeBrowser(browser);
   }
   return descriptions;
 }

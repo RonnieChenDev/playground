@@ -6,7 +6,11 @@ import { loadRejectedJobs, rejectedFileFor } from "./persistence/rejectedJobs";
 import { loadSeenIds, saveSeenIds, seenFileFor } from "./persistence/seenJobs";
 import { fetchSeekJobs } from "./seekFetcher";
 import { getOrCreateDigestQueueUrl } from "./sqs";
+import { withTimeout } from "./time";
 import { Profile, SmtpConfig } from "./types";
+
+// 单轮检查的最长耗时；超时后放弃这一轮，保证下一轮定时检查还能继续跑
+const CHECK_TIMEOUT_MS = 15 * 60 * 1000;
 
 export async function startSeekMonitor(
   profile: Profile,
@@ -90,21 +94,32 @@ export async function startSeekMonitor(
     await dispatchResults(profile, smtp, groups, digestQueueUrl, digestStateFile);
   };
 
-  await runCheck();
-
-  setInterval(async () => {
-    if (isChecking) return;
+  const safeRunCheck = async (): Promise<void> => {
+    if (isChecking) {
+      console.warn(
+        `⚠️  [SEEK:${profile.name}] Previous check still running, skipping this one.`,
+      );
+      return;
+    }
     isChecking = true;
     try {
-      const now = new Date().toLocaleTimeString("en-AU", {
-        timeZone: "Australia/Perth",
-      });
-      console.log(
-        `\n⏰ [${now}] [SEEK:${profile.name}] Running scheduled check...`,
-      );
-      await runCheck();
+      await withTimeout(runCheck(), CHECK_TIMEOUT_MS, "Scheduled check");
+    } catch (err) {
+      console.error(`❌ [SEEK:${profile.name}] Check failed:`, err);
     } finally {
       isChecking = false;
     }
+  };
+
+  await safeRunCheck();
+
+  setInterval(() => {
+    const now = new Date().toLocaleTimeString("en-AU", {
+      timeZone: "Australia/Perth",
+    });
+    console.log(
+      `\n⏰ [${now}] [SEEK:${profile.name}] Running scheduled check...`,
+    );
+    void safeRunCheck();
   }, profile.seekCheckIntervalMs);
 }
