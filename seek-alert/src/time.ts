@@ -9,3 +9,19 @@ export function perthNowParts(): { date: string; time: string } {
   });
   return { date, time };
 }
+
+// 给可能永远挂起的 Promise 加上限时：超时后 reject，避免调用方一直等下去
+export function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms / 1000}s`)),
+      ms,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
