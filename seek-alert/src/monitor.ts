@@ -2,7 +2,11 @@ import { checkOnce } from "./checkOnce";
 import { DEFAULT_CLAUDE_MODEL } from "./config";
 import { dispatchResults } from "./dispatchResults";
 import { digestStateFileFor } from "./persistence/digestState";
-import { loadRejectedJobs, rejectedFileFor } from "./persistence/rejectedJobs";
+import {
+  loadRejectedJobs,
+  rejectedFileFor,
+  rotateRejectedJobs,
+} from "./persistence/rejectedJobs";
 import { loadSeenIds, saveSeenIds, seenFileFor } from "./persistence/seenJobs";
 import { fetchSeekJobs } from "./seekFetcher";
 import { getOrCreateDigestQueueUrl } from "./sqs";
@@ -80,6 +84,14 @@ export async function startSeekMonitor(
   }
 
   const runCheck = async (): Promise<void> => {
+    try {
+      rotateRejectedJobs(rejectedJobs, rejectedFile);
+    } catch (err) {
+      console.error(
+        `❌ [SEEK:${profile.name}] Failed to rotate rejected jobs:`,
+        err,
+      );
+    }
     const groups = await checkOnce(
       profile.seekUrls,
       seenFile,
