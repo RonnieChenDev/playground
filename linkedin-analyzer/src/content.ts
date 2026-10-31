@@ -1,10 +1,22 @@
 import { JobAnalysis, AnalysisResponse, AnalyseJobMessage } from "./types";
 
-// LinkedIn renders job cards differently when logged in (scaffold list) and
-// logged out (public search), and its class names churn — so cards are found
-// by the job-id attributes, which have been far more stable.
+const COMPONENT_KEY_PREFIX = "job-card-component-ref-";
+const COMPONENT_CARD_SELECTOR = `[componentkey^="${COMPONENT_KEY_PREFIX}"]`;
+
+// LinkedIn renders job cards differently across its UIs (new search-results,
+// legacy logged-in list, logged-out public search), and its class names churn
+// or are hashed — so cards are found by the job-id attributes instead.
 const CARD_SOURCES: { selector: string; getId: (el: Element) => string | null }[] = [
-  // Logged in: virtualised list item (empty until scrolled into view)
+  // Logged in, new UI (/jobs/search-results/): hashed classes, the job id only
+  // lives in componentkey. Nested elements share the key — take the outermost.
+  {
+    selector: COMPONENT_CARD_SELECTOR,
+    getId: (el) =>
+      el.parentElement?.closest(COMPONENT_CARD_SELECTOR)
+        ? null
+        : el.getAttribute("componentkey")?.match(/(\d+)$/)?.[1] ?? null,
+  },
+  // Logged in, legacy UI: virtualised list item (empty until scrolled into view)
   {
     selector: "[data-occludable-job-id]",
     getId: (el) => el.getAttribute("data-occludable-job-id"),
@@ -23,12 +35,14 @@ const CARD_SOURCES: { selector: string; getId: (el: Element) => string | null }[
   },
 ];
 
-// Tried in order — the generic /jobs/view/ link is the last resort.
+// Tried in order. The new UI has no stable title hook — its title is simply
+// the first <p> in the card — so that is the last resort.
 const CARD_TITLE_SELECTORS = [
   ".job-card-list__title--link",
   ".job-card-container__link",
   ".base-search-card__title",
   'a[href*="/jobs/view/"]',
+  "p",
 ];
 
 const DETAIL_TITLE_SELECTORS = [
@@ -38,6 +52,7 @@ const DETAIL_TITLE_SELECTORS = [
 ];
 
 const BADGE_ATTR = "data-lja-job-id";
+const DETAIL_ATTR = "data-lja-detail";
 
 const analyses = new Map<string, Promise<AnalysisResponse>>();
 
@@ -323,7 +338,7 @@ function mountBadge(
   jobId: string,
   cardText: string,
   startExpanded = false
-) {
+): HTMLElement {
   const slot = document.createElement("div");
   slot.setAttribute(BADGE_ATTR, jobId);
   slot.appendChild(createLoadingBadge());
@@ -337,6 +352,33 @@ function mountBadge(
         : createErrorBadge(response.error ?? "Analysis failed")
     );
   });
+  return slot;
+}
+
+function normalise(text: string | null | undefined): string {
+  return text?.replace(/\s+/g, " ").trim() ?? "";
+}
+
+// Visible title text — the new UI pairs an aria-hidden visible span with a
+// screen-reader copy (e.g. "… (Verified job)") inside the same element.
+function visibleTitle(el: Element): string {
+  return normalise(el.querySelector('span[aria-hidden="true"]')?.textContent ?? el.textContent);
+}
+
+// Climbs out of inline / row-flex wrappers so the badge lands on its own line
+// below the title row rather than squeezed in beside it.
+function belowAnchor(titleEl: Element, boundary: Element): Element {
+  let el = titleEl;
+  while (el.parentElement && el.parentElement !== boundary) {
+    const style = getComputedStyle(el.parentElement);
+    const isRowLike =
+      style.display === "contents" ||
+      style.display.startsWith("inline") ||
+      (style.display.endsWith("flex") && style.flexDirection.startsWith("row"));
+    if (!isRowLike) break;
+    el = el.parentElement;
+  }
+  return el;
 }
 
 function processCards() {
@@ -352,8 +394,7 @@ function processCards() {
       const titleEl = findFirst(card, CARD_TITLE_SELECTORS);
       if (!titleEl) continue; // occluded card — retried once it renders
 
-      const anchor = titleEl.closest(".artdeco-entity-lockup__title, h3, h2") ?? titleEl;
-      mountBadge(anchor, jobId, extractCardText(card));
+      mountBadge(belowAnchor(titleEl, card), jobId, extractCardText(card));
     }
   }
 }
@@ -364,18 +405,41 @@ function currentDetailJobId(): string | null {
   return new URLSearchParams(location.search).get("currentJobId");
 }
 
+// New UI has hashed classes in the detail pane too: find the element outside
+// the card list whose text matches the selected card's title.
+function findDetailTitleByText(jobId: string): Element | null {
+  const card = document.querySelector(`[componentkey="${COMPONENT_KEY_PREFIX}${jobId}"]`);
+  const cardTitle = card && findFirst(card, CARD_TITLE_SELECTORS);
+  if (!cardTitle) return null;
+
+  const title = visibleTitle(cardTitle);
+  if (!title) return null;
+  return (
+    Array.from(document.querySelectorAll("h1, h2, p")).find(
+      (el) => !el.closest(COMPONENT_CARD_SELECTOR) && visibleTitle(el) === title
+    ) ?? null
+  );
+}
+
 // Job detail pane (search right-hand side) and standalone /jobs/view/ pages
 function processDetail() {
   const jobId = currentDetailJobId();
-  const titleEl = findFirst(document, DETAIL_TITLE_SELECTORS);
-  if (!jobId || !titleEl) return;
+  if (!jobId) return;
 
-  const container = titleEl.parentElement ?? titleEl;
-  const existing = container.querySelector(`:scope > [${BADGE_ATTR}]`);
-  if (existing?.getAttribute(BADGE_ATTR) === jobId) return;
-  existing?.remove();
+  const stale = Array.from(document.querySelectorAll(`[${DETAIL_ATTR}]`));
+  if (stale.some((el) => el.getAttribute(BADGE_ATTR) === jobId && el.isConnected)) return;
+  stale.forEach((el) => el.remove());
 
-  mountBadge(titleEl, jobId, titleEl.textContent?.replace(/\s+/g, " ").trim() ?? "", true);
+  const titleEl = findFirst(document, DETAIL_TITLE_SELECTORS) ?? findDetailTitleByText(jobId);
+  if (!titleEl) return;
+
+  const slot = mountBadge(
+    belowAnchor(titleEl, document.body),
+    jobId,
+    visibleTitle(titleEl),
+    true
+  );
+  slot.setAttribute(DETAIL_ATTR, "");
 }
 
 function scan() {

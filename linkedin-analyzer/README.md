@@ -12,8 +12,9 @@ LinkedIn version of [seek-analyzer](../seek-analyzer): shows an AI fit badge nex
   invalidates them. Opening the same job again costs no API call.
 - **Detail pane.** The job detail pane (`currentJobId`) and `/jobs/view/{id}` pages also get a badge,
   expanded by default.
-- **Both layouts.** Works on the logged-in jobs UI (`data-occludable-job-id` / `data-job-id`) and on
-  public search (`data-entity-urn`).
+- **All layouts.** Works on the new logged-in search (`/jobs/search-results/`, cards found by
+  `componentkey="job-card-component-ref-{id}"` because its classes are hashed), the legacy logged-in UI
+  (`data-occludable-job-id` / `data-job-id`), and public search (`data-entity-urn`).
 
 ## Build & install
 
