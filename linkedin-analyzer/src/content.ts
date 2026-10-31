@@ -74,14 +74,19 @@ function requestAnalysis(jobId: string, cardText: string): Promise<AnalysisRespo
   if (!pending) {
     const message: AnalyseJobMessage = { type: "ANALYSE_JOB", jobId, cardText };
     pending = new Promise<AnalysisResponse>((resolve) => {
-      chrome.runtime.sendMessage(message, (res: AnalysisResponse | undefined) => {
-        resolve(
-          res ?? {
-            success: false,
-            error: chrome.runtime.lastError?.message ?? "Analysis failed",
-          }
-        );
-      });
+      try {
+        chrome.runtime.sendMessage(message, (res: AnalysisResponse | undefined) => {
+          resolve(
+            res ?? {
+              success: false,
+              error: chrome.runtime.lastError?.message ?? "Analysis failed",
+            }
+          );
+        });
+      } catch (e: any) {
+        // Throws synchronously once the extension has been reloaded
+        resolve({ success: false, error: e.message ?? "Analysis failed" });
+      }
     });
     analyses.set(jobId, pending);
   }
@@ -444,7 +449,18 @@ function processDetail() {
 
 let paused = true; // until storage says otherwise
 
+// After the extension is reloaded/updated, this copy of the script keeps
+// running in already-open tabs but can no longer reach the extension. Remove
+// its badges and stop, rather than leaving "Analysing…" stuck forever.
+function teardownIfOrphaned(): boolean {
+  if (chrome.runtime?.id) return false;
+  observer.disconnect();
+  document.querySelectorAll(`[${BADGE_ATTR}]`).forEach((el) => el.remove());
+  return true;
+}
+
 function scan() {
+  if (teardownIfOrphaned()) return;
   if (paused || !location.pathname.startsWith("/jobs")) return;
   processCards();
   processDetail();
