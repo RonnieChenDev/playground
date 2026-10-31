@@ -227,6 +227,10 @@ async function getAnalysis(
   if (existing) return existing;
 
   const promise = enqueue(async () => {
+    // Paused while waiting in the queue — don't spend API calls on it
+    if ((await chrome.storage.sync.get("paused")).paused) {
+      throw new Error("Paused");
+    }
     const description = await fetchJobDescription(message.jobId);
     const jobText = description
       ? `${message.cardText}\n\n${description}`
@@ -239,6 +243,18 @@ async function getAnalysis(
   inFlight.set(message.jobId, promise);
   return promise;
 }
+
+function renderPausedBadge(paused: boolean) {
+  chrome.action.setBadgeText({ text: paused ? "OFF" : "" });
+  chrome.action.setBadgeBackgroundColor({ color: "#6b7280" });
+}
+
+chrome.storage.sync.get("paused", (stored) => renderPausedBadge(!!stored.paused));
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "sync" && changes.paused) {
+    renderPausedBadge(!!changes.paused.newValue);
+  }
+});
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type !== "ANALYSE_JOB") return false;

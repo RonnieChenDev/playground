@@ -442,14 +442,33 @@ function processDetail() {
   slot.setAttribute(DETAIL_ATTR, "");
 }
 
+let paused = true; // until storage says otherwise
+
 function scan() {
-  if (!location.pathname.startsWith("/jobs")) return;
+  if (paused || !location.pathname.startsWith("/jobs")) return;
   processCards();
   processDetail();
 }
 
+function setPaused(value: boolean) {
+  paused = value;
+  if (paused) {
+    document.querySelectorAll(`[${BADGE_ATTR}]`).forEach((el) => el.remove());
+    // Drop pending/failed requests so resuming starts clean (successes come
+    // back instantly from the background cache)
+    analyses.clear();
+  } else {
+    scan();
+  }
+}
+
 injectGlobalStyles();
-scan();
+chrome.storage.sync.get("paused", (stored) => setPaused(!!stored.paused));
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "sync" && changes.paused) {
+    setPaused(!!changes.paused.newValue);
+  }
+});
 
 // LinkedIn is an SPA that mutates constantly — debounce rescans
 let scanTimer: number | undefined;

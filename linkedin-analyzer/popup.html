@@ -44,6 +44,55 @@
     .dot.ok { background: #16a34a; }
     .dot.warn { background: #ca8a04; }
 
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .switch {
+      position: relative;
+      width: 36px;
+      height: 20px;
+      flex-shrink: 0;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      inset: 0;
+      border-radius: 9999px;
+      background: #d1d5db;
+      transition: background 0.15s;
+    }
+
+    .slider::before {
+      content: "";
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      left: 2px;
+      top: 2px;
+      border-radius: 50%;
+      background: white;
+      transition: transform 0.15s;
+    }
+
+    .switch input:checked + .slider { background: #6366f1; }
+    .switch input:checked + .slider::before { transform: translateX(16px); }
+
     a {
       display: block;
       margin-top: 14px;
@@ -59,6 +108,14 @@
 <body>
   <h2>LinkedIn Job Analyser</h2>
   <p class="sub">Inline AI fit scoring for LinkedIn listings</p>
+
+  <label class="toggle-row" for="enabled-toggle">
+    <span id="enabled-label">Analysis on</span>
+    <span class="switch">
+      <input type="checkbox" id="enabled-toggle" />
+      <span class="slider"></span>
+    </span>
+  </label>
 
   <div class="status-row" id="key-status">
     <span class="dot" id="key-dot"></span>

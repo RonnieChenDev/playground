@@ -21,6 +21,22 @@ chrome.storage.sync.get(["apiKey", "userProfile"], (stored) => {
   }
 });
 
+const enabledToggle = document.getElementById("enabled-toggle") as HTMLInputElement;
+const enabledLabel = document.getElementById("enabled-label") as HTMLElement;
+
+function renderEnabled(paused: boolean) {
+  enabledToggle.checked = !paused;
+  enabledLabel.textContent = paused ? "Analysis paused" : "Analysis on";
+}
+
+chrome.storage.sync.get("paused", (stored) => renderEnabled(!!stored.paused));
+
+enabledToggle.addEventListener("change", () => {
+  const paused = !enabledToggle.checked;
+  renderEnabled(paused);
+  chrome.storage.sync.set({ paused });
+});
+
 const link = document.getElementById("options-link");
 if (link) {
   link.addEventListener("click", (e) => {
