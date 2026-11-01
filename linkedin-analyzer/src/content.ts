@@ -1,4 +1,4 @@
-import { JobAnalysis, AnalysisResponse, AnalyseJobMessage } from "./types";
+import { JobAnalysis, AnalysisResponse, AnalyseJobMessage, UserProfile } from "./types";
 
 const COMPONENT_KEY_PREFIX = "job-card-component-ref-";
 const COMPONENT_CARD_SELECTOR = `[componentkey^="${COMPONENT_KEY_PREFIX}"]`;
@@ -43,6 +43,13 @@ const CARD_TITLE_SELECTORS = [
   ".base-search-card__title",
   'a[href*="/jobs/view/"]',
   "p",
+];
+
+// Legacy / public UIs only — in the new UI location is found by position
+const CARD_LOCATION_SELECTORS = [
+  ".job-search-card__location",
+  ".job-card-container__metadata-wrapper",
+  ".artdeco-entity-lockup__caption",
 ];
 
 const DETAIL_TITLE_SELECTORS = [
@@ -270,6 +277,18 @@ function createLoadingBadge(): HTMLElement {
   return el;
 }
 
+function createSkippedBadge(reason: string): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "lja-pill";
+  el.style.cssText = `
+    border: 1px dashed #d1d5db;
+    background: #f9fafb;
+    color: #9ca3af;
+  `;
+  el.textContent = `⏭ Skipped · ${reason}`;
+  return el;
+}
+
 function createErrorBadge(message: string): HTMLElement {
   const el = document.createElement("div");
   el.className = "lja-pill";
@@ -337,17 +356,24 @@ function findFirst(root: ParentNode, selectors: string[]): Element | null {
 
 // Mounts a loading badge after `anchor`, then swaps in the result. If LinkedIn
 // re-renders and drops the slot meanwhile, the next scan mounts a fresh one
-// that reuses the same pending/cached analysis.
+// that reuses the same pending/cached analysis. Skipped jobs never reach the API.
 function mountBadge(
   anchor: Element,
   jobId: string,
   cardText: string,
+  skipReason: string | null,
   startExpanded = false
 ): HTMLElement {
   const slot = document.createElement("div");
   slot.setAttribute(BADGE_ATTR, jobId);
-  slot.appendChild(createLoadingBadge());
   anchor.insertAdjacentElement("afterend", slot);
+
+  if (skipReason) {
+    slot.appendChild(createSkippedBadge(skipReason));
+    return slot;
+  }
+
+  slot.appendChild(createLoadingBadge());
 
   requestAnalysis(jobId, cardText).then((response) => {
     if (!slot.isConnected) return;
@@ -368,6 +394,43 @@ function normalise(text: string | null | undefined): string {
 // screen-reader copy (e.g. "… (Verified job)") inside the same element.
 function visibleTitle(el: Element): string {
   return normalise(el.querySelector('span[aria-hidden="true"]')?.textContent ?? el.textContent);
+}
+
+let excludedLocations: string[] = [];
+let excludedTitleKeywords: string[] = [];
+// Skip reasons from the card list, reused by the detail pane (which has no
+// reliable location element of its own)
+const skipReasons = new Map<string, string | null>();
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Whole-word, case-insensitive — so "SA" matches "Adelaide, SA" but not "NSA",
+// and "Lead" doesn't match "Leader"
+function findTerm(text: string, terms: string[]): string | undefined {
+  return terms.find((term) =>
+    new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(term)}($|[^\\p{L}\\p{N}])`, "iu").test(text)
+  );
+}
+
+function cardLocationText(card: Element): string {
+  const known = findFirst(card, CARD_LOCATION_SELECTORS);
+  if (known) return normalise(known.textContent);
+  // New UI: <p>s run title, company, location, extras — skip the first two so a
+  // company like "SA Power Networks" can't trigger a location match
+  return Array.from(card.querySelectorAll("p"))
+    .slice(2)
+    .map((p) => normalise(p.textContent))
+    .join(" | ");
+}
+
+function getSkipReason(title: string, locationText: string): string | null {
+  const titleHit = findTerm(title, excludedTitleKeywords);
+  if (titleHit) return `title: ${titleHit}`;
+  const locationHit = locationText && findTerm(locationText, excludedLocations);
+  if (locationHit) return `location: ${locationHit}`;
+  return null;
 }
 
 // Climbs out of inline / row-flex wrappers so the badge lands on its own line
@@ -399,7 +462,9 @@ function processCards() {
       const titleEl = findFirst(card, CARD_TITLE_SELECTORS);
       if (!titleEl) continue; // occluded card — retried once it renders
 
-      mountBadge(belowAnchor(titleEl, card), jobId, extractCardText(card));
+      const skipReason = getSkipReason(visibleTitle(titleEl), cardLocationText(card));
+      skipReasons.set(jobId, skipReason);
+      mountBadge(belowAnchor(titleEl, card), jobId, extractCardText(card), skipReason);
     }
   }
 }
@@ -438,12 +503,11 @@ function processDetail() {
   const titleEl = findFirst(document, DETAIL_TITLE_SELECTORS) ?? findDetailTitleByText(jobId);
   if (!titleEl) return;
 
-  const slot = mountBadge(
-    belowAnchor(titleEl, document.body),
-    jobId,
-    visibleTitle(titleEl),
-    true
-  );
+  const title = visibleTitle(titleEl);
+  const skipReason = skipReasons.has(jobId)
+    ? skipReasons.get(jobId)!
+    : getSkipReason(title, "");
+  const slot = mountBadge(belowAnchor(titleEl, document.body), jobId, title, skipReason, true);
   slot.setAttribute(DETAIL_ATTR, "");
 }
 
@@ -466,22 +530,38 @@ function scan() {
   processDetail();
 }
 
+// Removes every badge and forgets in-memory results. Successful analyses come
+// back instantly from the background cache on the next scan.
+function resetBadges() {
+  document.querySelectorAll(`[${BADGE_ATTR}]`).forEach((el) => el.remove());
+  analyses.clear();
+  skipReasons.clear();
+}
+
 function setPaused(value: boolean) {
   paused = value;
-  if (paused) {
-    document.querySelectorAll(`[${BADGE_ATTR}]`).forEach((el) => el.remove());
-    // Drop pending/failed requests so resuming starts clean (successes come
-    // back instantly from the background cache)
-    analyses.clear();
-  } else {
-    scan();
-  }
+  resetBadges();
+  scan();
+}
+
+function setProfile(profile: UserProfile | undefined) {
+  excludedLocations = profile?.excludedLocations ?? [];
+  excludedTitleKeywords = profile?.excludedTitleKeywords ?? [];
 }
 
 injectGlobalStyles();
-chrome.storage.sync.get("paused", (stored) => setPaused(!!stored.paused));
+chrome.storage.sync.get(["paused", "userProfile"], (stored) => {
+  setProfile(stored.userProfile);
+  setPaused(!!stored.paused);
+});
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "sync" && changes.paused) {
+  if (area !== "sync") return;
+  if (changes.userProfile) {
+    setProfile(changes.userProfile.newValue);
+    resetBadges();
+    scan();
+  }
+  if (changes.paused) {
     setPaused(!!changes.paused.newValue);
   }
 });

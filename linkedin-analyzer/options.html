@@ -173,6 +173,28 @@
         <p class="hint">Used to assess whether you're eligible to apply.</p>
       </div>
 
+      <div class="divider"></div>
+
+      <div class="field">
+        <label for="excluded-locations">Excluded Locations <span style="font-weight:400;color:#9ca3af">(optional)</span></label>
+        <input
+          type="text"
+          id="excluded-locations"
+          placeholder="NT, SA, Northern Territory, South Australia"
+        />
+        <p class="hint">Comma-separated. Jobs whose location contains any of these (whole word) are skipped — no API call.</p>
+      </div>
+
+      <div class="field">
+        <label for="excluded-titles">Excluded Title Keywords <span style="font-weight:400;color:#9ca3af">(optional)</span></label>
+        <input
+          type="text"
+          id="excluded-titles"
+          placeholder="Senior, Staff, Director, Lead, Principal"
+        />
+        <p class="hint">Comma-separated. Jobs whose title contains any of these (whole word, so "Lead" won't match "Leader") are skipped — no API call.</p>
+      </div>
+
       <button type="submit">Save Settings</button>
       <div id="status"></div>
     </form>

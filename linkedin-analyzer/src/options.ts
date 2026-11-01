@@ -4,6 +4,8 @@ const form = document.getElementById("options-form") as HTMLFormElement;
 const apiKeyInput = document.getElementById("api-key") as HTMLInputElement;
 const skillsInput = document.getElementById("skills") as HTMLInputElement;
 const visaSelect = document.getElementById("visa-status") as HTMLSelectElement;
+const excludedLocationsInput = document.getElementById("excluded-locations") as HTMLInputElement;
+const excludedTitlesInput = document.getElementById("excluded-titles") as HTMLInputElement;
 const statusEl = document.getElementById("status") as HTMLElement;
 
 function getSelectedExperience(): string[] {
@@ -19,6 +21,13 @@ function setSelectedExperience(values: string[]) {
     .forEach((cb) => {
       cb.checked = values.includes(cb.value);
     });
+}
+
+function parseList(value: string): string[] {
+  return value
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 function showStatus(message: string, isError = false) {
@@ -41,6 +50,8 @@ chrome.storage.sync.get(["apiKey", "userProfile"], (stored) => {
       : [profile.experience];
     setSelectedExperience(exp);
     visaSelect.value = profile.visaStatus ?? "student_visa";
+    excludedLocationsInput.value = (profile.excludedLocations ?? []).join(", ");
+    excludedTitlesInput.value = (profile.excludedTitleKeywords ?? []).join(", ");
   }
 });
 
@@ -65,15 +76,14 @@ form.addEventListener("submit", (e) => {
     return;
   }
 
-  const skills = rawSkills
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const skills = parseList(rawSkills);
 
   const userProfile: UserProfile = {
     skills,
     experience,
     visaStatus: visaSelect.value as UserProfile["visaStatus"],
+    excludedLocations: parseList(excludedLocationsInput.value),
+    excludedTitleKeywords: parseList(excludedTitlesInput.value),
   };
 
   chrome.storage.sync.set({ apiKey, userProfile }, () => {

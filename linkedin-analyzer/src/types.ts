@@ -2,6 +2,9 @@ export interface UserProfile {
   skills: string[];
   experience: string[];
   visaStatus: "citizen" | "pr" | "work_visa" | "student_visa" | "other";
+  // Jobs matching these are skipped before calling the API (whole-word, case-insensitive)
+  excludedLocations?: string[];
+  excludedTitleKeywords?: string[];
 }
 
 export interface JobAnalysis {

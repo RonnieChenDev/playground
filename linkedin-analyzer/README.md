@@ -10,6 +10,10 @@ LinkedIn version of [seek-analyzer](../seek-analyzer): shows an AI fit badge nex
   falls back to the card text.
 - **Cache.** Results are stored in `chrome.storage.local` per job ID for 7 days. Changing your profile
   invalidates them. Opening the same job again costs no API call.
+- **Filters without API calls.** Excluded locations (e.g. `NT, SA`) and excluded title keywords
+  (e.g. `Senior, Lead`) are matched whole-word, case-insensitively, in the page; matching jobs get a grey
+  "Skipped" label and are never sent to Claude.
+- **Pause.** A switch in the toolbar popup turns analysis off (the icon shows `OFF`).
 - **Detail pane.** The job detail pane (`currentJobId`) and `/jobs/view/{id}` pages also get a badge,
   expanded by default.
 - **All layouts.** Works on the new logged-in search (`/jobs/search-results/`, cards found by
